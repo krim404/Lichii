@@ -139,7 +139,7 @@ ENUM(GpuAccuracy, Low, High);
 ENUM(DmaAccuracy, Default, Unsafe, Safe);
 ENUM(GpuFenceBehavior, Default, Immediate, Balanced, Accurate);
 ENUM(NativeComputeWriteMark, Auto, Full);
-ENUM(CpuBackend, Dynarmic, Nce);
+ENUM(CpuBackend, Dynarmic, Nce, Hypervisor);
 ENUM(CpuAccuracy, Auto, Accurate, Unsafe, Paranoid, Debugging);
 ENUM(CpuClock, Normal, Boost, Overclock)
 ENUM(NativeAsyncDraws, Wait, Bounded, Skip);
