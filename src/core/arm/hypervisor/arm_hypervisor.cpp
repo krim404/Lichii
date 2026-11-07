@@ -11,7 +11,6 @@
 #include "common/cpu_features.h"
 #include "common/logging.h"
 #include "common/page_table.h"
-#include "common/settings.h"
 #include "core/arm/hypervisor/arm_hypervisor.h"
 #include "core/arm/hypervisor/hv_vm.h"
 #include "core/core.h"
@@ -291,12 +290,7 @@ void ArmHypervisor::FinishTrackedAccess() {
     hv_vcpu_set_sys_reg(m_vcpu, HV_SYS_REG_MDSCR_EL1, 0);
     // Restore the protection RasterizerMarkRegionCached applies, unless the GPU released the page
     // in the meantime.
-    if (IsRasterizerCached(m_step_process, m_step_page)) {
-        const auto perm = Settings::values.use_reactive_flushing.GetValue()
-                              ? Common::MemoryPermission{}
-                              : Common::MemoryPermission::Read;
-        m_vm.ProtectAccess(m_step_page, Memory::YUZU_PAGESIZE, perm);
-    }
+    m_step_process->GetMemory().ReprotectRasterizerPage(m_step_page);
 }
 
 bool ArmHypervisor::EmulateMemoryTagging(Kernel::KProcess* process, u64 pc) {
@@ -338,6 +332,32 @@ bool ArmHypervisor::EmulateMemoryTagging(Kernel::KProcess* process, u64 pc) {
             memory.WriteBlock(address, zeros.data(), opc == 3 ? 32 : 16);
         }
         return true;
+    }
+    const u32 rd = rt;
+    const auto add_tagged = [&](bool subtract) {
+        // ADDG, SUBG: the tag offset is ignored, the address offset is imm6 granules.
+        const u64 offset = static_cast<u64>((insn >> 16) & 0x3F) << 4;
+        SetBaseRegister(rd, subtract ? base - offset : base + offset);
+        return true;
+    };
+    if ((insn & 0xFFE0FC00) == 0x9AC01000) {
+        // IRG: the random tag is always 0.
+        SetBaseRegister(rd, base);
+        return true;
+    }
+    if ((insn & 0xFFE0FC00) == 0x9AC01400) {
+        // GMI: Xn's tag is 0, so the exclusion mask gains bit 0. Xd and Xm are XZR when 31.
+        if (rd != 31) {
+            const u32 rm = (insn >> 16) & 0x1F;
+            hv_vcpu_set_reg(m_vcpu, static_cast<hv_reg_t>(HV_REG_X0 + rd), get_data(rm) | 1);
+        }
+        return true;
+    }
+    if ((insn & 0xFFC0C000) == 0x91800000) {
+        return add_tagged(false);
+    }
+    if ((insn & 0xFFC0C000) == 0xD1800000) {
+        return add_tagged(true);
     }
     if ((insn & 0xFE400000) == 0x68000000 && ((insn >> 23) & 3) != 0) {
         // STGP
@@ -383,6 +403,7 @@ bool ArmHypervisor::EmulateTrackedAccess(Kernel::KProcess* process, u64 pc) {
     bool sign_to_64{};
     bool is_pair{};
     u32 rt2{};
+    bool is_ordered{};
     u64 address{};
     std::optional<u64> writeback;
 
@@ -499,6 +520,7 @@ bool ArmHypervisor::EmulateTrackedAccess(Kernel::KProcess* process, u64 pc) {
         // LDAR, LDAPR, STLR
         size_log2 = insn >> 30;
         is_load = (insn & 0x3FFFFC00) != 0x089FFC00;
+        is_ordered = true;
         address = GetBaseRegister(rn);
     } else {
         return false;
@@ -543,6 +565,10 @@ bool ArmHypervisor::EmulateTrackedAccess(Kernel::KProcess* process, u64 pc) {
 
     std::array<u8, 32> data{};
     const size_t total = is_pair ? size * 2 : size;
+    // LDAR/LDAPR/STLR keep their acquire/release semantics towards the natively running cores.
+    if (is_ordered) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     if (is_load) {
         memory.ReadBlock(address, data.data(), total);
         write_register(rt, data.data());
@@ -555,6 +581,9 @@ bool ArmHypervisor::EmulateTrackedAccess(Kernel::KProcess* process, u64 pc) {
             read_register(rt2, data.data() + size);
         }
         memory.WriteBlock(address, data.data(), total);
+    }
+    if (is_ordered) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
     }
     if (writeback) {
         SetBaseRegister(rn, *writeback);

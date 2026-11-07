@@ -80,9 +80,15 @@ struct Memory::Impl {
         if (process.IsApplication()) {
             hv_vm = nullptr;
             if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Hypervisor) {
-                hv_vm = HvVm::Create(system);
-                if (hv_vm == nullptr) {
-                    LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
+                // Hypervisor.framework allows one vCPU per host thread; single-core mode runs
+                // every guest core on one thread.
+                if (!system.IsMulticore()) {
+                    LOG_WARNING(HW_Memory, "Hypervisor needs multicore, falling back to Dynarmic");
+                } else {
+                    hv_vm = HvVm::Create(system);
+                    if (hv_vm == nullptr) {
+                        LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
+                    }
                 }
             }
             if (hv_vm == nullptr) {
@@ -541,28 +547,50 @@ struct Memory::Impl {
         }
     }
 
+    /// Host access to a region the rasterizer caches (or releases).
+    static Common::MemoryPermission CachedRegionPermission(bool cached) {
+        Common::MemoryPermission perm{};
+        // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
+        // them a CPU read of GPU-written memory can see stale data.
+        static const bool nx2_no_reactive = [] {
+            const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool reactive_flushing =
+            Settings::values.use_reactive_flushing.GetValue() &&
+            !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+        if (!reactive_flushing || !cached) {
+            perm |= Common::MemoryPermission::Read;
+        }
+        if (!cached) {
+            perm |= Common::MemoryPermission::Write;
+        }
+        return perm;
+    }
+
+    /// Restores the Hypervisor protection of a page that is still rasterizer-cached, including
+    /// its armed read trap.
+    void ReprotectCachedPage([[maybe_unused]] u64 vaddr) {
+#ifdef HAS_HYPERVISOR
+        if (!hv_vm || std::as_const(current_page_table->entries)[vaddr >> YUZU_PAGEBITS].Type() !=
+                          Common::PageType::RasterizerCachedMemory) {
+            return;
+        }
+        const Common::MemoryPermission perm = CachedRegionPermission(true);
+        hv_vm->ProtectAccess(vaddr, YUZU_PAGESIZE, perm);
+        if (perm != Common::MemoryPermission{}) {
+            ProtectArmedPages(vaddr, YUZU_PAGESIZE);
+        }
+#endif
+    }
+
     void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
 
         if (current_page_table->fastmem_arena || HasHypervisor()) {
-            Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
-                perm |= Common::MemoryPermission::Read;
-            }
-            if (!cached) {
-                perm |= Common::MemoryPermission::Write;
-            }
+            const Common::MemoryPermission perm = CachedRegionPermission(cached);
             if (current_page_table->fastmem_arena) {
                 host_buffer->Protect(vaddr, size, perm);
                 if (cached && perm != Common::MemoryPermission{}) {
@@ -1284,6 +1312,10 @@ void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug)
 
 void Memory::DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size) {
     impl->HandleRasterizerDownload(GetInteger(vaddr), size);
+}
+
+void Memory::ReprotectRasterizerPage(Common::ProcessAddress vaddr) {
+    impl->ReprotectCachedPage(GetInteger(vaddr));
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {

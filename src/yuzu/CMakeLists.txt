@@ -409,6 +409,9 @@ if (APPLE)
             # --deep: the bundle also holds files that aren't code (nx2_switches.txt in MacOS).
             COMMAND codesign --force --deep --sign - --entitlements
                     "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "$<TARGET_BUNDLE_DIR:yuzu>")
+    elseif (HAS_HYPERVISOR)
+        set_target_properties(yuzu PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements")
     endif()
 
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".dylib")

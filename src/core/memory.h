@@ -509,6 +509,9 @@ public:
     /// Makes GPU-modified data in a rasterizer-cached region visible to the CPU before it reads.
     void DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size);
 
+    /// Restores the CPU-backend protection of a page that is still rasterizer-cached.
+    void ReprotectRasterizerPage(Common::ProcessAddress vaddr);
+
     bool InvalidateSeparateHeap(void* fault_address);
 
 private:

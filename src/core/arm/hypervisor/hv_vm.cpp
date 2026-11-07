@@ -43,8 +43,9 @@ constexpr std::array<u32, 3> VectorSlot{
     0xD2800000, // mov x0, #0
     0xD4000002, // hvc #0
 };
-constexpr std::array<u32, 7> FlushStub{
+constexpr std::array<u32, 8> FlushStub{
     0xD2800000, // mov x0, #0
+    0xD5033B9F, // dsb ish: table updates from other threads complete before the invalidation
     0xD508831F, // tlbi vmalle1is
     0xD508711F, // ic ialluis
     0xD5033B9F, // dsb ish
@@ -133,14 +134,11 @@ bool HvVm::Initialize(System& system) {
 }
 
 bool HvVm::MapDram(System& system) {
-    // The VM outlives emulation sessions, but DeviceMemory is recreated when the memory layout
-    // changes (a Switch 1 title, then a Switch 2 one), so follow its current backing.
+    // The VM outlives emulation sessions, but DeviceMemory can be recreated between them, possibly
+    // at the same address, so every session maps its current backing again.
     u8* const base = system.DeviceMemory().buffer.BackingBasePointer();
     const u64 size = Common::AlignUp(
         Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize(), HostPageSize);
-    if (base == m_dram_base && size == m_dram_size) {
-        return true;
-    }
     if (m_dram_base != nullptr && hv_vm_unmap(0, m_dram_size) != HV_SUCCESS) {
         LOG_ERROR(Core_ARM, "Hypervisor: failed to unmap the previous DRAM");
         return false;
