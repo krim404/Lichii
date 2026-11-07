@@ -572,8 +572,12 @@ struct Memory::Impl {
     /// its armed read trap.
     void ReprotectCachedPage([[maybe_unused]] u64 vaddr) {
 #ifdef HAS_HYPERVISOR
-        if (!hv_vm || std::as_const(current_page_table->entries)[vaddr >> YUZU_PAGEBITS].Type() !=
-                          Common::PageType::RasterizerCachedMemory) {
+        if (!hv_vm) {
+            return;
+        }
+        std::scoped_lock lk{hv_cache_mutex};
+        if (std::as_const(current_page_table->entries)[vaddr >> YUZU_PAGEBITS].Type() !=
+            Common::PageType::RasterizerCachedMemory) {
             return;
         }
         const Common::MemoryPermission perm = CachedRegionPermission(true);
@@ -588,6 +592,14 @@ struct Memory::Impl {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
+#ifdef HAS_HYPERVISOR
+        // The permission change and the page type change happen together relative to
+        // ReprotectCachedPage, which restores protections from the page type.
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
 
         if (current_page_table->fastmem_arena || HasHypervisor()) {
             const Common::MemoryPermission perm = CachedRegionPermission(cached);
@@ -1106,6 +1118,9 @@ struct Memory::Impl {
     std::mutex sys_core_guard;
 #ifdef HAS_HYPERVISOR
     HvVm* hv_vm{};
+    /// Orders rasterizer cache transitions with Hypervisor reprotection; taken before
+    /// read_trap_mutex.
+    std::mutex hv_cache_mutex;
 #endif
 #ifdef __ANDROID__
     std::optional<Common::HeapTracker> heap_tracker;
