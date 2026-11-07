@@ -699,6 +699,14 @@ struct Memory::Impl {
             return;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+#ifdef HAS_HYPERVISOR
+        // The page type check and the trap protection happen together relative to cache
+        // transitions (RasterizerMarkRegionCached).
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
         std::scoped_lock lk{read_trap_mutex};
         u64 run_begin = 0;
         u64 run_pages = 0;
@@ -768,13 +776,23 @@ struct Memory::Impl {
         if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
             return;
         }
+#ifdef HAS_HYPERVISOR
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
-            // Still cached (this read came through the rasterizer path): writes stay trapped.
-            ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
-                                 Common::MemoryPermission::Read);
+            // Still cached (this read came through the rasterizer path): writes stay trapped. A
+            // page released in the meantime keeps the access its release set.
+            if (std::as_const(current_page_table->entries)[*it].Type() ==
+                Common::PageType::RasterizerCachedMemory) {
+                ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                                     Common::MemoryPermission::Read);
+            }
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
