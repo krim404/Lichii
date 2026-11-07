@@ -54,7 +54,7 @@ private:
     void LoadVcpuContext();
     void ReadVcpuContext(Kernel::Svc::ThreadContext& ctx) const;
     bool VcpuHoldsContext() const;
-    bool RunFlushStub();
+    bool RunFlushStub(bool instruction_cache = true);
     void ArmHeartbeat();
     bool EmulateSystemRegister(u64 esr);
     HaltReason HandleGuestException(Kernel::KThread* thread);
@@ -76,6 +76,7 @@ private:
     bool m_vcpu_created{};
     pthread_t m_owner_thread{};
     u64 m_flushed_generation{};
+    u64 m_code_flushed_generation{};
     u64 m_heartbeat_ticks{};
 
     // Guest registers. Once a thread has run, the vCPU holds the current values (m_ctx is only

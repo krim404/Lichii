@@ -53,6 +53,15 @@ constexpr std::array<u32, 8> FlushStub{
     0xD4000022, // hvc #1
     0xD4000022,
 };
+constexpr std::array<u32, 7> DataFlushStub{
+    0xD2800000, // mov x0, #0
+    0xD5033B9F, // dsb ish: table updates from other threads complete before the invalidation
+    0xD508831F, // tlbi vmalle1is
+    0xD5033B9F, // dsb ish
+    0xD5033FDF, // isb
+    0xD4000022, // hvc #1
+    0xD4000022,
+};
 
 u64 PermissionBits(Common::MemoryPermission perms) {
     if (perms == Common::MemoryPermission{}) {
@@ -164,6 +173,7 @@ void HvVm::Reset() {
         std::memcpy(m_tables + i * 0x80, VectorSlot.data(), sizeof(VectorSlot));
     }
     std::memcpy(m_tables + 0x800, FlushStub.data(), sizeof(FlushStub));
+    std::memcpy(m_tables + 0x880, DataFlushStub.data(), sizeof(DataFlushStub));
     m_next_table_offset = RootTableOffset + 0x1000;
 
     // The vectors are only visible to EL1.
@@ -171,6 +181,7 @@ void HvVm::Reset() {
     *entry = TableBaseIpa | DescValid | DescTableOrPage | AttrIndexNormal | ShareInner |
              AccessFlag | ApEl1ReadOnly | UserExecuteNever;
 
+    m_code_flush_generation.fetch_add(1, std::memory_order_release);
     m_flush_generation.fetch_add(1, std::memory_order_release);
 }
 
@@ -263,6 +274,9 @@ void HvVm::ProtectAccess(u64 vaddr, u64 size, Common::MemoryPermission perms) {
     } else if (True(perms & Common::MemoryPermission::Read)) {
         access_bits = DescValid | ApEl0ReadOnly;
     }
+    // Only taking access away needs the vCPUs to drop cached translations. A cached translation
+    // with less access than the table only faults, and the fault handler flushes before retrying.
+    bool reduced = false;
     {
         std::scoped_lock lk{m_table_mutex};
         for (u64 offset = 0; offset < size; offset += 0x1000) {
@@ -270,11 +284,19 @@ void HvVm::ProtectAccess(u64 vaddr, u64 size, Common::MemoryPermission perms) {
             if (pte == nullptr || (*pte & AddressMask) == 0) {
                 continue;
             }
-            const u64 entry = (*pte & ~(DescValid | ApEl0ReadOnly)) | access_bits;
+            const u64 old_entry = *pte;
+            const bool was_valid = (old_entry & DescValid) != 0;
+            const bool was_writable = was_valid && (old_entry & ApEl0ReadOnly) == ApEl0ReadWrite;
+            const bool is_valid = (access_bits & DescValid) != 0;
+            const bool is_writable = is_valid && (access_bits & ApEl0ReadOnly) == ApEl0ReadWrite;
+            reduced |= (was_valid && !is_valid) || (was_writable && !is_writable);
+            const u64 entry = (old_entry & ~(DescValid | ApEl0ReadOnly)) | access_bits;
             std::atomic_ref<u64>{*pte}.store(entry, std::memory_order_release);
         }
     }
-    RequestFlush();
+    if (reduced) {
+        RequestFlush(false);
+    }
 }
 
 bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
@@ -326,7 +348,10 @@ bool HvVm::Permits(u64 vaddr, bool write) {
     return !write || (*pte & ApEl0ReadOnly) == ApEl0ReadWrite;
 }
 
-void HvVm::RequestFlush() {
+void HvVm::RequestFlush(bool instruction_cache) {
+    if (instruction_cache) {
+        m_code_flush_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
     m_flush_generation.fetch_add(1, std::memory_order_acq_rel);
     std::scoped_lock lk{m_running_mutex};
     for (size_t i = 0; i < m_vcpus.size(); i++) {

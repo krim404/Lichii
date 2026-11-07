@@ -49,11 +49,16 @@ public:
     /// Returns whether the current stage-1 entry for vaddr allows the access.
     bool Permits(u64 vaddr, bool write);
 
-    /// Makes every vCPU flush its TLB and instruction cache before it next runs guest code.
-    void RequestFlush();
+    /// Makes every vCPU flush its TLB before it next runs guest code, and its instruction cache
+    /// too when instruction_cache is set (mappings or code changed, not only data access).
+    void RequestFlush(bool instruction_cache = true);
 
     u64 FlushGeneration() const {
         return m_flush_generation.load(std::memory_order_acquire);
+    }
+
+    u64 CodeFlushGeneration() const {
+        return m_code_flush_generation.load(std::memory_order_acquire);
     }
 
     void SetRunning(size_t core, hv_vcpu_t vcpu, bool running);
@@ -62,6 +67,8 @@ public:
     /// Offset of the "hvc" in each vector slot; the guest's x0 is in TPIDR_EL1 once it is reached.
     static constexpr u64 VectorHvcOffset = 8;
     static constexpr u64 FlushStubVa = VectorsVa + 0x800;
+    /// Like the flush stub, without the instruction cache invalidation.
+    static constexpr u64 DataFlushStubVa = VectorsVa + 0x880;
     static constexpr u64 TableBaseIpa = 1ULL << 39;
 
     u64 RootTableIpa() const {
@@ -89,6 +96,7 @@ private:
     std::mutex m_table_mutex;
 
     std::atomic<u64> m_flush_generation{1};
+    std::atomic<u64> m_code_flush_generation{1};
     std::mutex m_running_mutex;
     std::array<hv_vcpu_t, Hardware::NUM_CPU_CORES> m_vcpus{};
     std::array<bool, Hardware::NUM_CPU_CORES> m_running{};

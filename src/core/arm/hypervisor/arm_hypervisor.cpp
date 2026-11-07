@@ -126,6 +126,7 @@ bool ArmHypervisor::EnsureVcpu() {
     HV_CHECK(hv_vcpu_set_trap_debug_exceptions(m_vcpu, true));
 
     m_flushed_generation = 0;
+    m_code_flushed_generation = 0;
     LOG_INFO(Core_ARM, "Hypervisor: created vCPU for core {}", m_core_index);
     return true;
 }
@@ -195,7 +196,7 @@ void ArmHypervisor::ArmHeartbeat() {
     hv_vcpu_set_vtimer_mask(m_vcpu, false);
 }
 
-bool ArmHypervisor::RunFlushStub() {
+bool ArmHypervisor::RunFlushStub(bool instruction_cache) {
     u64 pc{}, cpsr{}, x0{}, mdscr{};
     hv_vcpu_get_reg(m_vcpu, HV_REG_PC, &pc);
     hv_vcpu_get_reg(m_vcpu, HV_REG_CPSR, &cpsr);
@@ -203,7 +204,8 @@ bool ArmHypervisor::RunFlushStub() {
     // A pending single step would trap on the first stub instruction.
     hv_vcpu_get_sys_reg(m_vcpu, HV_SYS_REG_MDSCR_EL1, &mdscr);
     hv_vcpu_set_sys_reg(m_vcpu, HV_SYS_REG_MDSCR_EL1, 0);
-    hv_vcpu_set_reg(m_vcpu, HV_REG_PC, HvVm::FlushStubVa);
+    hv_vcpu_set_reg(m_vcpu, HV_REG_PC,
+                    instruction_cache ? HvVm::FlushStubVa : HvVm::DataFlushStubVa);
     hv_vcpu_set_reg(m_vcpu, HV_REG_CPSR, PstateEl1h);
 
     bool done = false;
@@ -765,7 +767,10 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
             }
             if (const u64 generation = m_vm.FlushGeneration(); generation != m_flushed_generation) {
                 m_flushed_generation = generation;
-                if (!RunFlushStub()) {
+                const u64 code_generation = m_vm.CodeFlushGeneration();
+                const bool instruction_cache = code_generation != m_code_flushed_generation;
+                m_code_flushed_generation = code_generation;
+                if (!RunFlushStub(instruction_cache)) {
                     hr |= HaltReason::PrefetchAbort;
                     break;
                 }
