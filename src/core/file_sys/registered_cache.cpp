@@ -21,7 +21,9 @@
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/decrypted_nca.h"
 #include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
@@ -1295,6 +1297,42 @@ void ManualContentProvider::AddEntryWithVersion(TitleType title_type, ContentRec
 
 bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_content,
                                                     std::optional<u64> base_program_id) {
+    if (NupContainer::IsNupFile(file)) {
+        // A NUP holds loose trees: its add-ons are served as decrypted add-on NCAs, newest
+        // version per title (as in Eglantine-Community/Eglantine#724). Its updates are left to
+        // the NUP loader, which merges them into the program's RomFS.
+        NupContainer nup{file};
+        if (nup.GetStatus() != Loader::ResultStatus::Success) {
+            return false;
+        }
+        const auto& packages = nup.GetPackages();
+        std::map<u64, std::size_t> newest;
+        for (std::size_t i = 0; i < packages.size(); ++i) {
+            const auto& package = packages[i];
+            if (package.kind != NupContainer::PackageKind::Addon ||
+                (base_program_id && GetBaseTitleID(package.title_id) != *base_program_id)) {
+                continue;
+            }
+            const auto [it, inserted] = newest.try_emplace(package.title_id, i);
+            if (!inserted && package.version > packages[it->second].version) {
+                it->second = i;
+            }
+        }
+        bool added = false;
+        for (const auto& [title_id, index] : newest) {
+            const auto romfs_dir = nup.GetRomFSDir(index);
+            const auto romfs = romfs_dir != nullptr ? CreateRomFS(romfs_dir) : nullptr;
+            if (romfs == nullptr) {
+                LOG_WARNING(Loader, "NUP add-on {:016X} has no RomFS", title_id);
+                continue;
+            }
+            AddEntry(TitleType::AOC, ContentRecordType::Data, title_id,
+                     BuildAddOnContentNca(title_id, romfs));
+            added = true;
+        }
+        return added;
+    }
+
     const auto nsp = OpenContainerAsNsp(file, Loader::FileType::Unknown);
     if (!nsp) {
         return false;

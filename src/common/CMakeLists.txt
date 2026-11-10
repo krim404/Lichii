@@ -61,6 +61,8 @@ add_library(
     free_region_manager.h
     fs/file.cpp
     fs/file.h
+    fs/file_lock.cpp
+    fs/file_lock.h
     fs/fs.cpp
     fs/fs.h
     fs/fs_paths.h
@@ -69,6 +71,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    fs/profile_migration.cpp
+    fs/profile_migration.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -99,6 +103,8 @@ add_library(
     range_mutex.h
     range_sets.h
     range_sets.inc
+    recommended_settings.cpp
+    recommended_settings.h
     ring_buffer.h
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h

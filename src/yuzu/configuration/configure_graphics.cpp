@@ -35,6 +35,7 @@
 #include "ui_configure_graphics.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
+#include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
 
@@ -202,6 +203,7 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
     if (GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan) {
         vulkan_device = device;
     }
+    UpdateAmdFsr4Visibility();
 }
 
 ConfigureGraphics::~ConfigureGraphics() = default;
@@ -220,6 +222,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QCheckBox* nvidia_dlss_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -229,7 +232,15 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifndef EGLANTINE_STREAMLINE
         // Only builds with NVIDIA Streamline (Windows) can use it.
-        if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+        if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
+            continue;
+        }
+#endif
+#ifndef _WIN32
+        // AMD's FSR 4 runtime is Windows-only.
+        if (setting->Id() == Settings::values.amd_fsr4.Id()) {
             continue;
         }
 #endif
@@ -240,6 +251,10 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 return builder.BuildWidget(
                     setting, apply_funcs, ConfigurationShared::RequestType::ReverseSlider, true,
                     0.5f, nullptr, tr("%", "FSR/SGSR sharpening percentage (e.g. 50%)"));
+            } else if (setting->Id() == Settings::values.frame_rate_limit.Id()) {
+                return builder.BuildWidget(setting, apply_funcs,
+                                           ConfigurationShared::RequestType::Slider, true, 1.0f,
+                                           nullptr, tr(" Hz", "Frame rate limit (e.g. 120 Hz)"));
             } else {
                 return builder.BuildWidget(setting, apply_funcs);
             }
@@ -251,6 +266,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (!widget->Valid()) {
             widget->deleteLater();
             continue;
+        }
+
+        if (nvidia_dlss_checkbox && (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+                                     setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
+            widget->setVisible(nvidia_dlss_checkbox->isChecked());
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -332,6 +353,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifdef EGLANTINE_STREAMLINE
         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+            nvidia_dlss_checkbox = widget->checkbox;
             // NVIDIA's files and a download button under the checkbox.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
@@ -344,6 +366,18 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
             hold_graphics.emplace(setting->Id(), group);
 #endif
+        } else if (setting->Id() == Settings::values.amd_fsr4.Id()) {
+            // AMD's files and a download button under the checkbox, shown for GPUs FSR 4 runs on.
+            amd_fsr4_group = new QWidget(this);
+            QVBoxLayout* group_layout = new QVBoxLayout(amd_fsr4_group);
+            group_layout->setContentsMargins(0, 0, 0, 0);
+            group_layout->setSpacing(2);
+            group_layout->addWidget(widget);
+            AmdFsr4Panel* panel = new AmdFsr4Panel(amd_fsr4_group);
+            group_layout->addWidget(panel);
+            panel->setVisible(widget->checkbox->isChecked());
+            connect(widget->checkbox, &QCheckBox::toggled, panel, &QWidget::setVisible);
+            hold_graphics.emplace(setting->Id(), amd_fsr4_group);
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
@@ -459,6 +493,8 @@ void ConfigureGraphics::ApplyConfiguration() {
 
     UpdateVsyncSetting();
 
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+
     Settings::values.vulkan_device.SetGlobal(true);
     auto const index = Settings::EnumMetadata<Settings::RendererBackend>::Index();
     if (Settings::IsConfiguringGlobal() ||
@@ -517,6 +553,17 @@ void ConfigureGraphics::UpdateAPILayout() {
     if (is_vulkan && int(vulkan_device) < vulkan_device_combobox->count()) {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
     }
+    UpdateAmdFsr4Visibility();
+}
+
+void ConfigureGraphics::UpdateAmdFsr4Visibility() {
+    if (amd_fsr4_group == nullptr) {
+        return;
+    }
+    const int device = vulkan_device_combobox->currentIndex();
+    amd_fsr4_group->setVisible(GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                               device >= 0 && static_cast<size_t>(device) < records.size() &&
+                               records[device].fsr4_capable);
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {

@@ -80,6 +80,8 @@ add_executable(yuzu
     configuration/configure_general.ui
     configuration/configure_graphics.cpp
     configuration/configure_graphics.h
+    configuration/amd_fsr4_panel.cpp
+    configuration/amd_fsr4_panel.h
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel.h
     configuration/configure_graphics.ui
@@ -233,6 +235,8 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    shader_warm_dialog.h shader_warm_dialog.cpp
+    recommended_settings_dialog.h recommended_settings_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -256,7 +260,7 @@ add_executable(yuzu
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "lichii")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\lichii overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
@@ -493,5 +497,47 @@ endif()
 
 # Remember that the linker is incredibly stupid.
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
+
+# NX archive conversion and editing (nx_tools.cpp) runs nxformat in the process.
+if (TARGET nxformat::nxformat)
+    target_sources(yuzu PRIVATE nx_tools.h nx_tools.cpp)
+    target_link_libraries(yuzu PRIVATE nxformat::nxformat)
+    target_compile_definitions(yuzu PRIVATE LICHII_NX_TOOLS)
+    if (MSVC)
+        # Windows may refuse to load the unsigned DLL (Smart App Control, code integrity
+        # policies); delay-loaded, only the NX tools are lost, and NxTools::LoadNxformat says so.
+        target_link_options(yuzu PRIVATE /DELAYLOAD:nxformat.dll)
+        target_link_libraries(yuzu PRIVATE delayimp)
+    endif()
+endif()
+if (LICHII_NXFORMAT_RUNTIME)
+    add_custom_command(TARGET yuzu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${LICHII_NXFORMAT_RUNTIME}" "$<TARGET_FILE_DIR:yuzu>")
+    if (APPLE)
+        # The copy is beside the executable in Contents/MacOS; the build path recorded for the
+        # imported library doesn't exist on a user's Mac.
+        set_property(TARGET yuzu APPEND PROPERTY BUILD_RPATH "@executable_path")
+    elseif (UNIX)
+        # The release tar.gz ships the library next to the executable and an install puts it in
+        # a private library directory; neither has the build path recorded for the imported
+        # library.
+        include(GNUInstallDirs)
+        set_property(TARGET yuzu APPEND PROPERTY BUILD_RPATH "\$ORIGIN")
+        set_property(TARGET yuzu APPEND PROPERTY INSTALL_RPATH "\$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/lichii")
+        install(FILES "${LICHII_NXFORMAT_RUNTIME}" DESTINATION "${CMAKE_INSTALL_LIBDIR}/lichii")
+    endif()
+endif()
+
+# The Hypervisor CPU backend needs the hypervisor entitlement; an ad-hoc signature is enough.
+if (HAS_HYPERVISOR AND NOT CMAKE_GENERATOR MATCHES "Xcode")
+    add_custom_command(TARGET yuzu POST_BUILD
+        # --deep: the bundle also holds files that aren't code (nx2_switches.txt in MacOS).
+        COMMAND codesign --force --deep --sign - --entitlements
+                "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements" "$<TARGET_BUNDLE_DIR:yuzu>")
+elseif (HAS_HYPERVISOR)
+    set_target_properties(yuzu PROPERTIES
+        XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/dist/eglantine.entitlements")
+endif()
 
 create_target_directory_groups(yuzu)

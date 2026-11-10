@@ -10,6 +10,8 @@
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
+#include <psapi.h>
+#include <vector>
 #include "common/dynamic_library.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
@@ -81,6 +83,7 @@ namespace Common {
 thread_local HostMemory::AllocationTestControl* HostMemory::allocation_test_control{};
 
 [[maybe_unused]] constexpr size_t PageAlignment = 0x1000;
+[[maybe_unused]] constexpr int BackingAttempts = 5; // fastmem backing allocation tries (Windows)
 [[maybe_unused]] constexpr size_t HugePageSize = 0x200000;
 
 #ifdef _WIN32
@@ -158,8 +161,32 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Allocate backing file map. SEC_COMMIT charges all of it to the commit limit up front, and
+        // when the free commit is only just above its size the call fails with
+        // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
+        // runs the whole session without fastmem (Ocarina of Time: 20-25% fewer fps). A private
+        // commit of the same size does grow the page file, so make one, release it and try again.
+        for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
+            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+            if (backing_handle) {
+                if (attempt > 1) {
+                    LOG_INFO(HW_Memory, "Allocated {} MiB of backing memory on attempt {}", backing_size >> 20, attempt);
+                }
+                break;
+            }
+            const DWORD error = GetLastError();
+            MEMORYSTATUSEX status{};
+            status.dwLength = sizeof(status);
+            GlobalMemoryStatusEx(&status);
+            LOG_WARNING(HW_Memory, "Failed to allocate {} MiB of backing memory (attempt {}, error {}, {} MiB of commit free)",
+                        backing_size >> 20, attempt, error, status.ullAvailPageFile >> 20);
+            if (void* const probe = VirtualAlloc(nullptr, backing_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+                VirtualFree(probe, 0, MEM_RELEASE);
+            }
+            if (attempt < BackingAttempts) {
+                Sleep(50);
+            }
+        }
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;
@@ -249,6 +276,20 @@ public:
             }
             ++it;
         }
+    }
+
+    /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
+    std::optional<size_t> BackingOffset(size_t virtual_offset) {
+        std::scoped_lock lock{placeholder_mutex};
+        const auto it = placeholders.find(virtual_offset);
+        if (it == placeholders.end()) {
+            return std::nullopt;
+        }
+        const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
+        if (host_pointer_it == placeholder_host_pointers.end()) {
+            return std::nullopt;
+        }
+        return host_pointer_it->second + virtual_offset - it->lower();
     }
 
     void EnableDirectMappedAddress() {
@@ -1063,8 +1104,10 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.
         VirtualUnlock(address, length);
-#elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
+#elif defined(__linux__) && defined(MADV_COLD)
+        // MADV_COLD only deactivates the pages, like VirtualUnlock. MADV_PAGEOUT writes them to
+        // swap right away while holding the mmap lock, which stalled every guest core for 3-15 s.
+        madvise(address, length, MADV_COLD);
 #else
         static_cast<void>(address);
 #endif
@@ -1073,6 +1116,106 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
     if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
         hint(virtual_base + *virtual_offset);
     }
+}
+
+namespace {
+std::atomic<u64> g_zero_filled_bytes{};
+
+[[maybe_unused]] bool IsZeroPage(const u8* page) {
+    const auto* words = reinterpret_cast<const u64*>(page);
+    u64 bits = 0;
+    for (size_t i = 0; i < PageAlignment / sizeof(u64); ++i) {
+        bits |= words[i];
+    }
+    return bits == 0;
+}
+} // namespace
+
+u64 HostMemory::ZeroFilledBytes() noexcept {
+    return g_zero_filled_bytes.load(std::memory_order_relaxed);
+}
+
+std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
+#ifdef _WIN32
+    if (backing_base == nullptr) {
+        return {0, 0};
+    }
+    std::vector<ULONG_PTR> entries(size_t{1} << 22);
+    for (int attempt = 0;; ++attempt) {
+        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
+                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
+            break;
+        }
+        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
+            return {0, 0};
+        }
+        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
+    }
+    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
+    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
+    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
+    const size_t view_size = impl ? impl->virtual_size : 0;
+    std::vector<uintptr_t> backing_pages;
+    std::vector<uintptr_t> view_pages;
+    for (size_t i = 1; i <= count; ++i) {
+        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
+        if (page - backing_begin < backing_size) {
+            backing_pages.push_back(page);
+        } else if (view_begin != 0 && page - view_begin < view_size) {
+            view_pages.push_back(page);
+        }
+    }
+    std::sort(backing_pages.begin(), backing_pages.end());
+    // Pages are only ever read through the backing, which stays mapped and writable: a view page
+    // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
+    // write that lands after the check costs a soft fault and nothing else.
+    std::vector<uintptr_t> trim;
+    size_t zero_bytes = 0;
+    for (const uintptr_t page : backing_pages) {
+        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
+            trim.push_back(page);
+            zero_bytes += PageAlignment;
+        }
+    }
+    for (const uintptr_t page : view_pages) {
+        const auto offset = impl->BackingOffset(page - view_begin);
+        if (!offset || *offset >= backing_size) {
+            continue;
+        }
+        const uintptr_t backing_page = backing_begin + *offset;
+        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
+            trim.push_back(page);
+            zero_bytes += PageAlignment;
+        }
+        // Reading it put the backing page in the working set: take it out again.
+        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
+            trim.push_back(backing_page);
+        }
+    }
+    std::sort(trim.begin(), trim.end());
+    trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
+    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
+    const auto unlock = [](uintptr_t begin, uintptr_t end) {
+        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
+            GetLastError() == ERROR_NOT_LOCKED) {
+            return;
+        }
+        for (uintptr_t page = begin; page < end; page += PageAlignment) {
+            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
+        }
+    };
+    for (size_t i = 0; i < trim.size();) {
+        size_t j = i + 1;
+        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
+            ++j;
+        }
+        unlock(trim[i], trim[j - 1] + PageAlignment);
+        i = j;
+    }
+    return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
+#else
+    return {0, 0};
+#endif
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
@@ -1109,6 +1252,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 #endif
             if (!cleared) {
                 std::memset(backing_base + offset, 0, clear_end - offset);
+                g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
             }
             if (whole) {
                 granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);

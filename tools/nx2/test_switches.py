@@ -17,7 +17,7 @@ class SwitchDiscovery(unittest.TestCase):
         self.root = pathlib.Path(self.tmp.name)
         self.bin = self.root / "mount/usr/bin"
         self.bin.mkdir(parents=True)
-        self.config = self.root / "config/eden"
+        self.config = self.root / "config/lichii"
         self.config.mkdir(parents=True)
         source = self.root / "probe.cpp"
         source.write_text('''#include "yuzu/nx2_switches.h"
@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         self.assertEqual(self.run_probe(self.bin / "lichii", "EDEN_STREAMLINE_DIR"), "/trusted")
 
     def test_invalid_config_base_does_not_search_cwd(self):
-        cwd_config = self.root / "eden"
+        cwd_config = self.root / "lichii"
         cwd_config.mkdir()
         (cwd_config / "nx2_switches.txt").write_text("EDEN_NX2_PRELOAD_ALL_PIPELINES=99\n")
         for base in ("", "."):

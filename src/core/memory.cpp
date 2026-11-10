@@ -34,6 +34,9 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/hv_vm.h"
+#endif
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -72,6 +75,27 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+
+#ifdef HAS_HYPERVISOR
+        if (process.IsApplication()) {
+            hv_vm = nullptr;
+            if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Hypervisor) {
+                // Hypervisor.framework allows one vCPU per host thread; single-core mode runs
+                // every guest core on one thread.
+                if (!system.IsMulticore()) {
+                    LOG_WARNING(HW_Memory, "Hypervisor needs multicore, falling back to Dynarmic");
+                } else {
+                    hv_vm = HvVm::Create(system);
+                    if (hv_vm == nullptr) {
+                        LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
+                    }
+                }
+            }
+            if (hv_vm == nullptr) {
+                HvVm::Deactivate();
+            }
+        }
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -87,6 +111,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms);
+        }
+#endif
     }
 
     void UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -99,6 +128,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Unmap(GetInteger(base), size);
+        }
+#endif
     }
 
     void ProtectRegion(Common::PageTable& page_table, VAddr vaddr, u64 size,
@@ -106,9 +140,20 @@ struct Memory::Impl {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
 
-        if (!current_page_table->fastmem_arena) {
+        if (!current_page_table->fastmem_arena && !HasHypervisor()) {
             return;
         }
+
+        const auto protect = [&](u64 begin, u64 bytes) {
+            if (current_page_table->fastmem_arena) {
+                host_buffer->Protect(begin, bytes, perms);
+            }
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->Protect(begin, bytes, perms);
+            }
+#endif
+        };
 
         u64 protect_bytes = 0, protect_begin = 0;
 
@@ -118,7 +163,7 @@ struct Memory::Impl {
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
-                    host_buffer->Protect(protect_begin, protect_bytes, perms);
+                    protect(protect_begin, protect_bytes);
                     protect_bytes = 0;
                 }
                 break;
@@ -130,8 +175,16 @@ struct Memory::Impl {
         }
 
         if (protect_bytes > 0) {
-            host_buffer->Protect(protect_begin, protect_bytes, perms);
+            protect(protect_begin, protect_bytes);
         }
+    }
+
+    bool HasHypervisor() const {
+#ifdef HAS_HYPERVISOR
+        return hv_vm != nullptr;
+#else
+        return false;
+#endif
     }
 
     [[nodiscard]] u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
@@ -494,32 +547,76 @@ struct Memory::Impl {
         }
     }
 
+    /// Host access to a region the rasterizer caches (or releases).
+    static Common::MemoryPermission CachedRegionPermission(bool cached) {
+        Common::MemoryPermission perm{};
+        // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
+        // them a CPU read of GPU-written memory can see stale data.
+        static const bool nx2_no_reactive = [] {
+            const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+            return value != nullptr && value[0] == '1';
+        }();
+        const bool reactive_flushing =
+            Settings::values.use_reactive_flushing.GetValue() &&
+            !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+        if (!reactive_flushing || !cached) {
+            perm |= Common::MemoryPermission::Read;
+        }
+        if (!cached) {
+            perm |= Common::MemoryPermission::Write;
+        }
+        return perm;
+    }
+
+    /// Restores the Hypervisor protection of a page that is still rasterizer-cached, including
+    /// its armed read trap.
+    void ReprotectCachedPage([[maybe_unused]] u64 vaddr) {
+#ifdef HAS_HYPERVISOR
+        if (!hv_vm) {
+            return;
+        }
+        std::scoped_lock lk{hv_cache_mutex};
+        if (std::as_const(current_page_table->entries)[vaddr >> YUZU_PAGEBITS].Type() !=
+            Common::PageType::RasterizerCachedMemory) {
+            return;
+        }
+        const Common::MemoryPermission perm = CachedRegionPermission(true);
+        hv_vm->ProtectAccess(vaddr, YUZU_PAGESIZE, perm);
+        if (perm != Common::MemoryPermission{}) {
+            ProtectArmedPages(vaddr, YUZU_PAGESIZE);
+        }
+#endif
+    }
+
     void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
             return;
         }
+#ifdef HAS_HYPERVISOR
+        // The permission change and the page type change happen together relative to
+        // ReprotectCachedPage, which restores protections from the page type.
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
 
-        if (current_page_table->fastmem_arena) {
-            Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
-                perm |= Common::MemoryPermission::Read;
+        if (current_page_table->fastmem_arena || HasHypervisor()) {
+            const Common::MemoryPermission perm = CachedRegionPermission(cached);
+            if (current_page_table->fastmem_arena) {
+                host_buffer->Protect(vaddr, size, perm);
+                if (cached && perm != Common::MemoryPermission{}) {
+                    ProtectArmedPages(vaddr, size);
+                }
             }
-            if (!cached) {
-                perm |= Common::MemoryPermission::Write;
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->ProtectAccess(vaddr, size, perm);
+                if (cached && perm != Common::MemoryPermission{}) {
+                    ProtectArmedPages(vaddr, size);
+                }
             }
-            host_buffer->Protect(vaddr, size, perm);
-            if (cached && perm != Common::MemoryPermission{}) {
-                ProtectArmedPages(vaddr, size);
-            }
+#endif
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -589,7 +686,7 @@ struct Memory::Impl {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
         }();
-        return !disabled && current_page_table->fastmem_arena &&
+        return !disabled && (current_page_table->fastmem_arena || HasHypervisor()) &&
                !Settings::values.use_reactive_flushing.GetValue() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
@@ -602,6 +699,14 @@ struct Memory::Impl {
             return;
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+#ifdef HAS_HYPERVISOR
+        // The page type check and the trap protection happen together relative to cache
+        // transitions (RasterizerMarkRegionCached).
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
         std::scoped_lock lk{read_trap_mutex};
         u64 run_begin = 0;
         u64 run_pages = 0;
@@ -609,7 +714,7 @@ struct Memory::Impl {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                ProtectReadTrapPages(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
@@ -640,6 +745,19 @@ struct Memory::Impl {
         return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
     }
 
+    /// Sets the access of read-trapped pages in whichever host mapping the CPU backend reads
+    /// through: the fastmem arena (Dynarmic) or the Hypervisor's guest page tables.
+    void ProtectReadTrapPages(u64 vaddr, u64 size, Common::MemoryPermission perm) {
+        if (current_page_table->fastmem_arena) {
+            host_buffer->Protect(vaddr, size, perm);
+        }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->ProtectAccess(vaddr, size, perm);
+        }
+#endif
+    }
+
     /// Takes read permission away again from armed pages that were just cached again.
     void ProtectArmedPages(u64 vaddr, u64 size) {
         if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
@@ -649,7 +767,7 @@ struct Memory::Impl {
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
         }
     }
 
@@ -658,13 +776,23 @@ struct Memory::Impl {
         if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
             return;
         }
+#ifdef HAS_HYPERVISOR
+        std::unique_lock hv_lock{hv_cache_mutex, std::defer_lock};
+        if (hv_vm) {
+            hv_lock.lock();
+        }
+#endif
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
-            // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
-                                 Common::MemoryPermission::Read);
+            // Still cached (this read came through the rasterizer path): writes stay trapped. A
+            // page released in the meantime keeps the access its release set.
+            if (std::as_const(current_page_table->entries)[*it].Type() ==
+                Common::PageType::RasterizerCachedMemory) {
+                ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                                     Common::MemoryPermission::Read);
+            }
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -961,6 +1089,9 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+            // A download writing to guest memory here may have looked at the collected writes
+            // before this one: its bytes would land over the ones stored after this returns.
+            VideoCore::DownloadLanding::Await(address, size);
         });
     }
 
@@ -1003,6 +1134,12 @@ struct Memory::Impl {
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
+#ifdef HAS_HYPERVISOR
+    HvVm* hv_vm{};
+    /// Orders rasterizer cache transitions with Hypervisor reprotection; taken before
+    /// read_trap_mutex.
+    std::mutex hv_cache_mutex;
+#endif
 #ifdef __ANDROID__
     std::optional<Common::HeapTracker> heap_tracker;
     Common::HeapTracker* host_buffer{};
@@ -1204,6 +1341,14 @@ void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
+}
+
+void Memory::DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size) {
+    impl->HandleRasterizerDownload(GetInteger(vaddr), size);
+}
+
+void Memory::ReprotectRasterizerPage(Common::ProcessAddress vaddr) {
+    impl->ReprotectCachedPage(GetInteger(vaddr));
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {

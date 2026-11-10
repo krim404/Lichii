@@ -91,6 +91,7 @@ public:
 
 public slots:
     void SetNupConversionRunning(bool running);
+    void SetNxToolRunning(bool running);
     void RefreshGameDirectory();
     void RefreshExternalContent();
     void UpdateIconSizes();
@@ -103,6 +104,8 @@ signals:
     void OpenFolderRequested(u64 program_id, GameListOpenTarget target,
                              const std::string& game_path);
     void OpenTransferableShaderCacheRequested(u64 program_id);
+    void PrepareShaderWarmRequested(u64 program_id, const std::string& game_path);
+    void DeleteShaderWarmRequested(u64 program_id);
     void RemoveInstalledEntryRequested(u64 program_id, QtCommon::Game::InstalledEntryType type);
     void RemoveFileRequested(u64 program_id, QtCommon::Game::GameListRemoveTarget target,
                              const std::string& game_path);
@@ -113,6 +116,10 @@ signals:
     void ConvertToNupRequested(const std::string& game_path);
     void ExtractNupRequested(const std::string& game_path);
     void EditNupMetadataRequested(const std::string& game_path);
+    void ConvertToNxRequested(const std::string& game_path);
+    void AddToNxRequested(const std::string& game_path);
+    void RemoveFromNxRequested(const std::string& game_path);
+    void EditNxMetadataRequested(const std::string& game_path);
     void CopyTIDRequested(u64 program_id);
     void CreateShortcut(u64 program_id, const std::string& game_path,
                         const QtCommon::Game::ShortcutTarget target);
@@ -174,6 +181,7 @@ private:
     bool m_isTreeMode = true;
     bool m_populating = false;
     bool nup_conversion_running{};
+    bool nx_tool_running{};
     u64 reportable_program_id{};
     QAbstractItemView* m_currentView = nullptr;
 };

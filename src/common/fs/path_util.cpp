@@ -89,6 +89,10 @@ public:
         return legacy_paths.at(legacy_path);
     }
 
+    bool IsPortableMode() const {
+        return portable;
+    }
+
     void CreateEdenPaths() {
         std::for_each(eden_paths.begin(), eden_paths.end(), [](auto &path) {
             void(FS::CreateDirs(path.second));
@@ -114,6 +118,7 @@ public:
 #ifdef _WIN32
         // User directory takes priority over global %AppData% directory
         eden_path = GetExeDirectory() / PORTABLE_DIR;
+        portable = IsDir(eden_path);
         if (!Exists(eden_path) || !IsDir(eden_path)) {
             eden_path = GetAppDataRoamingDirectory() / EDEN_DIR;
         }
@@ -126,13 +131,16 @@ public:
         LEGACY_PATH(Sudachi, SUDACHI)
         LEGACY_PATH(Yuzu, YUZU)
         LEGACY_PATH(Suyu, SUYU)
+        LEGACY_PATH(LegacyEden, EDEN_LEGACY)
 #undef LEGACY_PATH
 #elif __ANDROID__
+        portable = true;
         ASSERT(!eden_path.empty());
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
 #else
         eden_path = GetCurrentDir() / PORTABLE_DIR;
+        portable = IsDir(eden_path);
         if (!Exists(eden_path) || !IsDir(eden_path)) {
             eden_path = GetDataDirectory("XDG_DATA_HOME") / EDEN_DIR;
             eden_path_cache = GetDataDirectory("XDG_CACHE_HOME") / EDEN_DIR;
@@ -148,6 +156,7 @@ public:
         LEGACY_PATH(Sudachi, SUDACHI)
         LEGACY_PATH(Yuzu, YUZU)
         LEGACY_PATH(Suyu, SUYU)
+        LEGACY_PATH(LegacyEden, EDEN_LEGACY)
 #undef LEGACY_PATH
 #endif
         // data
@@ -169,6 +178,7 @@ public:
         GenerateEdenPath(EdenPath::TASDir, eden_path / TAS_DIR);
         GenerateEdenPath(EdenPath::IconsDir, eden_path / ICONS_DIR);
         GenerateEdenPath(EdenPath::StreamlineDir, eden_path / STREAMLINE_DIR);
+        GenerateEdenPath(EdenPath::FidelityFxDir, eden_path / FIDELITYFX_DIR);
         // config
         GenerateEdenPath(EdenPath::ConfigDir, eden_path_config);
         // cache
@@ -202,6 +212,7 @@ private:
 
     ::Common::unordered_map<EdenPath, fs::path> eden_paths;
     ::Common::unordered_map<EmuPath, fs::path> legacy_paths;
+    bool portable{};
 };
 
 bool ValidatePath(const fs::path& path) {
@@ -283,6 +294,10 @@ fs::path RemoveTrailingSeparators(const fs::path& path) {
 
 void SetAppDirectory(const std::string& app_directory) {
     PathManagerImpl::GetInstance().Reinitialize(app_directory);
+}
+
+bool IsPortableMode() {
+    return PathManagerImpl::GetInstance().IsPortableMode();
 }
 
 const fs::path& GetEdenPath(EdenPath eden_path) {

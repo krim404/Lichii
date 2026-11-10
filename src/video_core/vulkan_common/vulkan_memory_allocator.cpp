@@ -13,12 +13,25 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <dxgi1_4.h>
+#endif
+
+#include <cstring>
+#include <iterator>
+#include <string>
+
+#include <fmt/format.h>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include <ranges>
+#include "video_core/vulkan_common/unbacked_fallback.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -209,20 +222,20 @@ MemoryAllocator::~MemoryAllocator() = default;
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     vk::Image image;
-    vk::Check(AllocateImage(ci, dedicated, image));
+    vk::Check(AllocateImage(ci, dedicated, false, image));
     return image;
 }
 
 vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, bool dedicated) const {
     vk::Image image;
-    const VkResult result = AllocateImage(ci, dedicated, image);
+    const VkResult result = AllocateImage(ci, dedicated, true, image);
     if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
         vk::Check(result);
     }
     return image;
 }
 
-VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated,
+VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
@@ -243,11 +256,8 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
-    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
-    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
-    // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    const bool huge = texels > (u64{1} << 28);
+    const bool huge = texels > MaxBackedImageTexels;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
                            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
@@ -283,13 +293,15 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
-        if (!huge) {
-            pressure_events.fetch_add(1, std::memory_order_relaxed);
-        }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        pressure_events.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
+        UsesUnbackedFallback(texels, may_fail)) {
         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
-        // nothing bound, so views and copies still work, instead of aborting.
+        // nothing bound, so views and copies still work, instead of aborting. A smaller image
+        // gets one only for a caller that would throw otherwise.
         if (vk::Image sparse = CreateUnbackedImage(ci)) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
@@ -303,6 +315,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     if (result != VK_SUCCESS) {
         failed_images.fetch_add(1, std::memory_order_relaxed);
         static u32 failed_logged{};
+        if (failed_logged == 0) {
+            // What ran out: the device's heaps or the host's commit. Before the error line,
+            // which is the one that reaches the log file when the session ends here.
+            LogMemoryTrace(device);
+        }
         if (failed_logged++ < 32) {
             LOG_ERROR(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
                       ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
@@ -446,7 +463,32 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result =
+            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // Over the device memory budget, as images are in CreateImage: buffers have no
+            // unbacked fallback, and the vk::Exception a failed staging or buffer cache
+            // allocation throws from the GPU thread aborts the process. Phones share RAM with
+            // the GPU, so the budget is often lower than the memory that is really free.
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} bytes (usage {}) is over the memory budget; "
+                            "allocating it anyway",
+                            ci.size, static_cast<u32>(usage));
+            }
+            // The texture cache answers each pressure event by keeping more device memory free.
+            // Upload and download buffers live in host memory on a discrete GPU, so they only
+            // count when the heaps are shared or the buffer asked for device-local memory.
+            if (device.IsIntegrated() || usage == MemoryUsage::DeviceLocal ||
+                usage == MemoryUsage::Stream) {
+                pressure_events.fetch_add(1, std::memory_order_relaxed);
+            }
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -592,6 +634,112 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     vk::Check(res);
     vk::Check(vmaBindBufferMemory2(allocator, a, 0, raw, nullptr));
     return MemoryCommit(allocator, a, info);
+}
+
+#ifdef _WIN32
+namespace {
+/// The DXGI adapter of the Vulkan device (matched by LUID), or null. Looked up again when the
+/// device changes (another GPU picked between sessions).
+IDXGIAdapter3* FindDxgiAdapter(const Device& device) {
+    VkPhysicalDeviceIDProperties id{};
+    id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &id;
+    device.GetPhysical().GetProperties2(properties);
+    if (!id.deviceLUIDValid) {
+        return nullptr;
+    }
+    LUID luid{};
+    std::memcpy(&luid, id.deviceLUID, sizeof(luid));
+    static LUID cached_luid{};
+    static IDXGIAdapter3* cached{};
+    if (cached != nullptr && cached_luid.LowPart == luid.LowPart &&
+        cached_luid.HighPart == luid.HighPart) {
+        return cached;
+    }
+    if (cached != nullptr) {
+        cached->Release();
+        cached = nullptr;
+    }
+    cached_luid = luid;
+    const HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    if (dxgi == nullptr) {
+        return nullptr;
+    }
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create =
+        reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    IDXGIFactory4* factory{};
+    if (create == nullptr ||
+        FAILED(create(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory)))) {
+        return nullptr;
+    }
+    if (FAILED(factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter3),
+                                          reinterpret_cast<void**>(&cached)))) {
+        cached = nullptr;
+    }
+    factory->Release();
+    return cached;
+}
+} // Anonymous namespace
+#endif
+
+void LogMemoryTrace(const Device& device) {
+    const Common::ProcessMemoryUsage process = Common::GetProcessMemoryUsage();
+    LOG_INFO(Render_Vulkan,
+             "Memory trace: process commit {} MiB, working set {} MiB (private {} MiB), system "
+             "commit {} of {} MiB",
+             process.commit >> 20, process.working_set >> 20, process.private_working_set >> 20,
+             process.system_commit >> 20, process.system_commit_limit >> 20);
+#ifdef _WIN32
+    // This process's use of the card's memory (local) and of system memory for the GPU
+    // (non-local: host memory types, and what the OS moved out of video memory).
+    IDXGIAdapter3* const adapter = FindDxgiAdapter(device);
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+    DXGI_QUERY_VIDEO_MEMORY_INFO non_local{};
+    if (adapter != nullptr &&
+        SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+        SUCCEEDED(
+            adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &non_local))) {
+        LOG_INFO(Render_Vulkan,
+                 "Memory trace: DXGI local {} of {} MiB, non-local {} of {} MiB",
+                 local.CurrentUsage >> 20, local.Budget >> 20, non_local.CurrentUsage >> 20,
+                 non_local.Budget >> 20);
+    }
+#endif
+    const VmaAllocator allocator = device.GetAllocator();
+    const VkPhysicalDeviceMemoryProperties* properties{};
+    vmaGetMemoryProperties(allocator, &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    std::string heaps;
+    for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+        const VmaBudget& budget = budgets[heap];
+        fmt::format_to(std::back_inserter(heaps), "{}{} ({}): driver {} of {} MiB, VMA {}/{} MiB",
+                       heap == 0 ? "" : "; ", heap,
+                       (properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0
+                           ? "local"
+                           : "host",
+                       budget.usage >> 20, budget.budget >> 20,
+                       budget.statistics.allocationBytes >> 20,
+                       budget.statistics.blockBytes >> 20);
+    }
+    LOG_INFO(Render_Vulkan, "Memory trace: heaps {}", heaps);
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(allocator, &stats);
+    std::string types;
+    for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
+        const VmaStatistics& s = stats.memoryType[type].statistics;
+        if (s.blockCount == 0) {
+            continue;
+        }
+        fmt::format_to(std::back_inserter(types), "{}{} (heap {}, flags {:#x}): {} allocs {}/{} MiB",
+                       types.empty() ? "" : "; ", type, properties->memoryTypes[type].heapIndex,
+                       static_cast<u32>(properties->memoryTypes[type].propertyFlags),
+                       s.allocationCount, s.allocationBytes >> 20, s.blockBytes >> 20);
+    }
+    LOG_INFO(Render_Vulkan, "Memory trace: types {}", types);
 }
 
 void LogMemoryStatistics(const Device& device) {

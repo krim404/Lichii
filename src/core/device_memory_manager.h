@@ -73,6 +73,12 @@ public:
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
 
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
     // Write / Read
     template <typename T>
     T* GetPointer(DAddr address);
@@ -245,7 +251,11 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    /// Starts past every earlier manager's: one built where a destroyed one was must not match
+    /// the translations a thread kept for that one (Translations compares owner and generation).
+    static inline std::atomic<u64> next_generation_base{1};
+    /// Bumped by Map and Unmap
+    std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);

@@ -80,6 +80,12 @@ PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
     ui->fps->setFont(font);
     ui->frametime->setFont(font);
 
+    m_dlssLabel = new QLabel(this);
+    m_dlssLabel->setFont(font);
+    m_dlssLabel->setStyleSheet(QStringLiteral("color: white;"));
+    m_dlssLabel->setVisible(false);
+    ui->verticalLayout->insertWidget(0, m_dlssLabel);
+
     // pos/stats
     resetPosition(m_mainWindow->pos());
     connect(parent, &MainWindow::positionChanged, this, &PerformanceOverlay::resetPosition);
@@ -97,12 +103,18 @@ void PerformanceOverlay::resetPosition(const QPoint& _) {
 
 void PerformanceOverlay::updateStats(const Core::PerfStatsResults& results,
                                      const VideoCore::ShaderNotify& shaders) {
+    m_dlssLabel->setText(m_mainWindow->DlssStatusText());
+    m_dlssLabel->setVisible(!m_mainWindow->DlssStatusText().isEmpty());
     auto fps = results.average_game_fps;
     if (!std::isnan(fps)) {
         // don't sample measurements < 3 fps because they are probably outliers or freezes
         static constexpr double FPS_SAMPLE_THRESHOLD = 3.0;
 
         QString fpsText = tr("%1 fps").arg(std::round(fps), 0, 'f', 0);
+        // Frames frame generation added, kept short for the overlay's width.
+        if (const double generated = m_mainWindow->FrameGenFps(); generated >= 0.5) {
+            fpsText += tr(" (+%1)").arg(std::round(generated), 0, 'f', 0);
+        }
         // if (!m_fpsSuffix.isEmpty()) fpsText = fpsText % QStringLiteral(" (%1)").arg(m_fpsSuffix);
         ui->fps->setText(fpsText);
 

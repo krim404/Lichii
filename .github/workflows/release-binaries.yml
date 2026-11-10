@@ -126,7 +126,11 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
-      # The packages docs/Deps.md lists for macOS, plus ccache.
+      # The packages docs/Deps.md lists for macOS, plus ccache. The runner image can carry a
+      # freetype 2.15.0 bottle that links /usr/lib/libhvf.dylib, which macOS has only from 15.4, so
+      # the bundled copy stopped the app from starting on 15.0 to 15.3 (#892). Homebrew rebuilt the
+      # Sequoia bottle without HVF (homebrew-core 85373af); a rebuilt bottle keeps the version
+      # number, so only an updated tap and an explicit reinstall replace the image's copy.
       - name: Install macOS dependencies
         if: startsWith(matrix.platform, 'macos')
         shell: bash
@@ -137,6 +141,15 @@ jobs:
           brew install autoconf automake boost ffmpeg fmt glslang hidapi libtool libusb lz4 ninja \
             nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
             vulkan-loader spirv-tools vulkan-utility-libraries ccache
+          freetype="$(brew --prefix freetype)/lib/libfreetype.6.dylib"
+          if otool -L "$freetype" | grep -F /usr/lib/libhvf.dylib > /dev/null; then
+            brew update --quiet
+            HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew reinstall freetype
+            if otool -L "$freetype" | grep -F /usr/lib/libhvf.dylib; then
+              echo "::error::$freetype still links libhvf.dylib, which macOS 15.0 to 15.3 lack"
+              exit 1
+            fi
+          fi
 
       - name: Install Qt on Linux x86_64
         if: startsWith(matrix.platform, 'linux') && runner.arch != 'ARM64'
@@ -268,6 +281,7 @@ jobs:
             -DYUZU_ROOM=OFF
             -DYUZU_ROOM_STANDALONE=OFF
             -DYUZU_USE_BUNDLED_QT=OFF
+            -DENABLE_QT_TRANSLATION=ON
             "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
             -DYUZU_USE_BUNDLED_SDL3=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
@@ -314,6 +328,7 @@ jobs:
             -DYUZU_ROOM=OFF \
             -DYUZU_ROOM_STANDALONE=OFF \
             -DYUZU_USE_BUNDLED_QT=OFF \
+            -DENABLE_QT_TRANSLATION=ON \
             -DYUZU_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
@@ -341,6 +356,7 @@ jobs:
             -DYUZU_ROOM=OFF \
             -DYUZU_ROOM_STANDALONE=OFF \
             -DYUZU_USE_BUNDLED_QT=OFF \
+            -DENABLE_QT_TRANSLATION=ON \
             "-DCMAKE_PREFIX_PATH=$(brew --prefix qt@6);$(brew --prefix zlib)" \
             "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
@@ -381,30 +397,21 @@ jobs:
             .sccache
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
-      # Plain tar.gz with the two programs and switch defaults. GitHub artifacts drop executable
-      # bits, so a tar preserves them. This needs Qt 6 and the usual system libraries installed.
-      - name: Package Linux tar.gz
+      # Both Linux packages are self-contained: linuxdeploy bundles every library the two programs
+      # need except the base system ones (glibc, X11/Wayland client libraries, the GPU driver and
+      # Vulkan loader), and its Qt plugin adds the Qt libraries and platform plugins. The AppImage
+      # packs that folder into one file; the tar.gz holds the same folder for systems without FUSE,
+      # with lichii and eden-cli links at its top. Both run on glibc 2.39+ systems. A tar.gz of the
+      # bare programs needed the Qt 6.8 they were built against installed system-wide (#901).
+      - name: Package Linux AppImage and tar.gz
         if: startsWith(matrix.platform, 'linux')
         shell: bash
         run: |
           set -euo pipefail
           test -x build/release/bin/lichii
           test -x build/release/bin/eden-cli
+          test -f build/release/bin/libnxformat.so
           strip build/release/bin/lichii build/release/bin/eden-cli
-          tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
-            -C build/release/bin lichii eden-cli nx2_switches.txt
-          ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
-
-      # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
-      # the base system ones (glibc, X11/Wayland client libraries, the GPU driver and Vulkan loader),
-      # and its Qt plugin adds the Qt libraries and platform plugins. Runs on glibc 2.39+ systems.
-      - name: Package Linux AppImage
-        if: startsWith(matrix.platform, 'linux')
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -x build/release/bin/lichii
-          test -x build/release/bin/eden-cli
           tools="$RUNNER_TEMP/linuxdeploy"
           mkdir -p "$tools"
           arch=$(uname -m)   # aarch64 or x86_64
@@ -437,6 +444,13 @@ jobs:
             --output appimage
           test -s "$LDAI_OUTPUT"
           ls -la "$LDAI_OUTPUT"
+          test -f AppDir/usr/lib/libnxformat.so
+          test -f AppDir/usr/bin/qt.conf
+          mv AppDir lichii
+          ln -s usr/bin/lichii lichii/lichii
+          ln -s usr/bin/eden-cli lichii/eden-cli
+          tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" lichii
+          ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
 
       - name: Package Windows binary
         if: startsWith(matrix.platform, 'windows')
@@ -450,8 +464,9 @@ jobs:
           windeployqt --release --no-translations build/release/bin/lichii.exe
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
-      # programs load into the bundle, then the leftover Homebrew search paths are removed so a
-      # machine with Homebrew still uses the bundled copies. Ad-hoc signed, not notarized.
+      # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
+      # removed so a machine with Homebrew still uses the bundled copies. Ad-hoc signed, not
+      # notarized.
       - name: Package macOS app
         if: startsWith(matrix.platform, 'macos')
         shell: bash
@@ -470,7 +485,8 @@ jobs:
             -exec sh -c 'file -b "$1" | grep -q Mach-O' _ {} \; -print)
           for binary in $binaries; do
             otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-              { grep -E '^/(opt/homebrew|usr/local)/' || true; } | while read -r rpath; do
+              { grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$GITHUB_WORKSPACE/" || true; } |
+              while read -r rpath; do
                 install_name_tool -delete_rpath "$rpath" "$binary" 2> /dev/null
               done
           done
@@ -480,13 +496,22 @@ jobs:
               "$app/Contents/MacOS/$program" 2> /dev/null
           done
           leaks=$(for binary in $binaries; do
-            otool -L "$binary" | grep -E '^\s+/(opt/homebrew|usr/local)/'
+            otool -L "$binary" | grep -E -e '^\s+/(opt/homebrew|usr/local)/' -e "^\s+$GITHUB_WORKSPACE/"
             otool -l "$binary" | awk '/cmd LC_RPATH/ {getline; getline; print $2}' |
-              grep -E '^/(opt/homebrew|usr/local)/'
+              grep -E -e '^/(opt/homebrew|usr/local)/' -e "^$GITHUB_WORKSPACE/"
           done || true)
           if [ -n "$leaks" ]; then
             echo "References still pointing outside the bundle:"
             echo "$leaks" | sort -u
+            exit 1
+          fi
+          # dyld refuses to start the app when a linked system library is missing, and libhvf.dylib
+          # ships only with macOS 15.4 and later, newer than the 15.0 deployment target (#892).
+          hvf=$(for binary in $binaries; do
+            otool -L "$binary" | grep -F /usr/lib/libhvf.dylib > /dev/null && echo "$binary"
+          done || true)
+          if [ -n "$hvf" ]; then
+            echo "::error::these link /usr/lib/libhvf.dylib, which macOS 15.0 to 15.3 lack: $hvf"
             exit 1
           fi
           # macdeployqt invalidates the signatures. The programs get the entitlements when the
@@ -498,6 +523,64 @@ jobs:
             codesign --force --sign - --entitlements dist/eglantine.entitlements "$app"
           fi
           codesign --verify --deep --strict "$app"
+          # libnxformat must resolve inside the bundle: lichii names it through @rpath,
+          # @executable_path or @loader_path (as macdeployqt rewrites it), every LC_RPATH of lichii
+          # is bundle-relative, the dylib is where they point, and the dylib itself depends only on
+          # @rpath and system libraries.
+          exe="$app/Contents/MacOS/lichii"
+          echo "otool -L lichii:"; otool -L "$exe"
+          rpaths=$(otool -l "$exe" | awk '/cmd LC_RPATH/ {getline; getline; print $2}')
+          echo "LC_RPATH lichii:"; echo "$rpaths"
+          ref=$(otool -L "$exe" | awk '/libnxformat\.dylib/ {print $1}')
+          case "$ref" in
+            @rpath/*|@executable_path/*|@loader_path/*) ;;
+            *) echo "::error::lichii references libnxformat as '$ref'"; exit 1 ;;
+          esac
+          for rpath in $rpaths; do
+            case "$rpath" in
+              @executable_path*|@loader_path*) ;;
+              *) echo "::error::lichii has an LC_RPATH outside the bundle: $rpath"; exit 1 ;;
+            esac
+          done
+          dylib=
+          if [[ $ref == @rpath/* ]]; then
+            for rpath in $rpaths; do
+              dir=${rpath/#@executable_path/$app/Contents/MacOS}
+              dir=${dir/#@loader_path/$app/Contents/MacOS}
+              if [ -z "$dylib" ] && [ -f "$dir/${ref#@rpath/}" ]; then
+                dylib="$dir/${ref#@rpath/}"
+              fi
+            done
+          else
+            target=${ref/#@executable_path/$app/Contents/MacOS}
+            target=${target/#@loader_path/$app/Contents/MacOS}
+            if [ -f "$target" ]; then
+              dylib=$target
+            fi
+          fi
+          if [ -z "$dylib" ]; then
+            echo "::error::$ref does not resolve inside lichii.app"
+            exit 1
+          fi
+          echo "libnxformat resolves to $dylib"
+          echo "otool -L libnxformat:"; otool -arch arm64 -L "$dylib"
+          echo "LC_RPATH libnxformat:"
+          otool -arch arm64 -l "$dylib" | awk '/cmd LC_RPATH/ {getline; getline; print $2}'
+          outside=$(otool -arch arm64 -L "$dylib" | tail -n +2 | awk '{print $1}' |
+            grep -vE '^(@rpath/|@executable_path/|@loader_path/|/usr/lib/|/System/Library/)' || true)
+          if [ -n "$outside" ]; then
+            echo "::error::libnxformat.dylib depends on libraries outside the bundle: $outside"
+            exit 1
+          fi
+          # Advisory: start the app for 20 s and look for dyld loading libnxformat from the bundle.
+          status=0
+          DYLD_PRINT_LIBRARIES=1 QT_QPA_PLATFORM=offscreen \
+            perl -e 'alarm 20; exec @ARGV' "$exe" > launch.log 2>&1 || status=$?
+          echo "launch exit status: $status"
+          if ! grep -E 'lichii\.app/Contents/.*libnxformat\.dylib' launch.log; then
+            echo "::warning::the launch check did not see libnxformat.dylib load from lichii.app"
+            tail -n 40 launch.log || true
+          fi
           ditto -c -k --keepParent "$app" "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.zip"
           # Also ship a .dmg (drag lichii.app onto Applications).
@@ -634,7 +717,7 @@ jobs:
 
           ## Linux
 
-          Linux packages come as an AppImage (self-contained, needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch) and a tar.gz (uses your system libraries, so Qt 6 and the usual libraries must be installed).
+          Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
 
           $({
             row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"

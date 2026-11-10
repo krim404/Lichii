@@ -13,9 +13,11 @@ This contains documentation created by developers, build instructions, guideline
 - **[Dependencies](./Deps.md)**
 - **[Debug Guidelines](./Debug.md)**
   - **[RenderDoc](./Debug.md#renderdoc)**
+- **[Fuzzing the game-file parsers](./Fuzzing.md)**
 - **[CPM - CMake Package Manager](./CPMUtil.md)**
 - **[Platform-Specific Caveats](./Caveats.md)**
 - **[The NVIDIA SM86 (Maxwell) GPU](./NvidiaGpu.md)**
+- **[AMD GPUs and Switch 2 titles](./nx2/amd.md)**
 - **[Driver Bugs](./DriverBugs.md)**
 - **[Building Older Commits](./build/OlderCommits.md)**
 - Subsystems:

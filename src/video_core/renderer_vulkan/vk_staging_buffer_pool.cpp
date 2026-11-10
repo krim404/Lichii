@@ -15,6 +15,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -223,6 +224,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
 }
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+    const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::StagingCreate};
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -231,7 +233,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .size = 1ULL << log2_size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, // mesh emulation dispatch and draw arguments
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -279,6 +282,17 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
     }
 }
 
+u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
+    u64 bytes{};
+    const StagingBuffersCache& cache = GetCache(usage);
+    for (size_t level = 0; level < NUM_LEVELS; ++level) {
+        if (!cache[level].entries.empty()) {
+            bytes += u64{cache[level].entries.size()} << level;
+        }
+    }
+    return bytes;
+}
+
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
     ReleaseLevel(GetCache(usage), current_delete_level);
 }
@@ -288,6 +302,24 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
+
+    // Keep two idle upload buffers per level up to 32 MiB (under 128 MiB in all). Each level is
+    // swept every 64 frames, so after a pause each upload over 8 MiB (past the stream buffer's
+    // regions) got a new dedicated allocation, written to for the first time (16 MiB on an
+    // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
+    constexpr size_t KeepMaxLog2 = 25;
+    constexpr size_t KeepPerLevel = 2;
+    if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+        size_t idle = 0;
+        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        });
+        staging.delete_index = 0;
+        if (staging.iterate_index > entries.size()) {
+            staging.iterate_index = 0;
+        }
+        return;
+    }
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
         return scheduler.IsFree(entry.tick);

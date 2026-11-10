@@ -131,6 +131,11 @@ public:
     [[nodiscard]] std::chrono::microseconds GetGlobalTimeUs() const noexcept;
     [[nodiscard]] std::chrono::nanoseconds GetGlobalTimeNs() const noexcept;
 
+    /// Global time (GetGlobalTimeNs) at which emulation last resumed from a pause.
+    [[nodiscard]] std::chrono::nanoseconds GetPauseEndTime() const noexcept {
+        return std::chrono::nanoseconds{pause_end_time.load(std::memory_order_relaxed)};
+    }
+
     /// Checks for events manually and returns time in nanoseconds for next event, threadsafe.
     std::optional<s64> Advance();
 
@@ -142,6 +147,9 @@ public:
 
     void Reset();
 
+    /// Waits on `event` until next_time, sleeping in the OS for most of it.
+    void WaitForEvent(s64 next_time);
+
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
     s64 global_timer = 0;
@@ -149,7 +157,7 @@ public:
     s64 timer_resolution_ns;
 #endif
     u64 event_fifo_id = 0;
-    s64 pause_end_time{};
+    std::atomic<s64> pause_end_time{};
     /// Cycle timing
     u64 cpu_ticks{};
     s64 downcount{};
@@ -164,6 +172,9 @@ public:
     std::atomic<bool> wait_set{};
     std::atomic<bool> has_started{};
     bool is_multicore{};
+    /// Logs the timer thread's waits once a second (EDEN_NX2_HOSTTIMING_STATS=1, or the debug
+    /// server's host_timing).
+    std::atomic<bool> host_wait_stats{};
 };
 
 /// Creates a core timing event with the given name and callback.

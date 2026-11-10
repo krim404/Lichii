@@ -173,7 +173,9 @@ namespace Vulkan {
         }
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
-        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, vk::Image &image) const;
+        /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).
+        VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
+                               vk::Image &image) const;
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
@@ -189,5 +191,9 @@ namespace Vulkan {
 
     /// Logs VMA's blocks and allocations per memory type, and each heap's budget.
     void LogMemoryStatistics(const Device& device);
+
+    /// One line each for the process's memory, what DXGI counts for the GPU (Windows), and VMA's
+    /// heaps and memory types against what the driver reports (EDEN_NX2_MEM_TRACE).
+    void LogMemoryTrace(const Device& device);
 
 } // namespace Vulkan

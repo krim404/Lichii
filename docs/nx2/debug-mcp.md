@@ -211,6 +211,15 @@ the self, self-and-caller and inclusive counts per function. The report and its 
 to `samples-<session>-<n>.txt` in the dump directory. Windows only; the threads run slower while
 sampled, so read fps from a run without it.
 
+**`speed_limit`** `{on?}`. Lifts (`false`) or restores (`true`) the speed limit live and returns
+the `previous` and current `on` state, so a test script can boot through the logos and menus
+unlimited. Without `on` it only reports the state. Use it through `--call`; the MCP adapter does
+not list it.
+
+**`host_timing`** `{stats?}`. Turns the per-second `HostTiming wait` log line
+(`EDEN_NX2_HOSTTIMING_STATS`) on or off and returns the `previous` and current `stats` state.
+Read the lines with `log_tail` (`contains: "HostTiming wait"`).
+
 **`reject_shaders`** `{hashes?, reject?, timeout_s?}`. This is `EDEN_NX2_REJECT_HASH` at
 runtime: the same keys (native program key or shader hash) and the same effect. Pipeline
 invalidation turned out to be tractable:

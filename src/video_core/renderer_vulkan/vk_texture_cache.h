@@ -123,6 +123,9 @@ public:
 
     void LogMemoryStatistics() const;
 
+    /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
+    void LogMemoryTrace();
+
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
 
@@ -255,6 +258,13 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
+    /// upscalers), resolved on first use.
+    [[nodiscard]] f32 OcarinaFsrLodBias();
+    std::optional<f32> ocarina_fsr_lod_bias;
+    /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
+    bool ocarina_fsr_failed{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -479,6 +489,8 @@ public:
 
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
+
+    u32 HostMipLevels() const noexcept;
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
@@ -848,6 +860,8 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
+        bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -872,6 +886,7 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
@@ -882,6 +897,7 @@ private:
     bool has_added_anisotropy{};
     bool has_linear_filtering{};
     bool has_depth_comparison{};
+    f32 added_lod_bias{}; ///< Ocarina FSR part of base_ci.mipLodBias
     bool has_minmax_reduction{};
     bool has_custom_border_colors{};
     bool has_srgb_border_color{};

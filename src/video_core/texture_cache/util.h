@@ -140,6 +140,17 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
 
+/// Sets `written[level * layers + layer]` for each level and layer of `dst` that `copies` from
+/// `src` write whole, unscaled and from the origin. Sets none when the images differ in 2D format,
+/// the format is compressed, or either image is rescaled or lacks part of its host memory (sparse,
+/// unbacked, trimmed levels).
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written);
+
+/// Whether `copies` from `src` write every texel of `dst` (MarkSubresourcesWrittenWhole).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
+
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);
 

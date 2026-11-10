@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "common/stb.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/frontend/framebuffer_layout.h"
@@ -486,6 +487,25 @@ json SampleThreads(ToolState& state, const json& params) {
     return {{"file", path.generic_string()}, {"report", std::move(report)}};
 }
 
+// Lifts or restores the speed limit (test scripts boot through the logos and menus unlimited).
+json SpeedLimit(ToolState&, const json& params) {
+    auto& setting = Settings::values.use_speed_limit;
+    const bool previous = setting.GetValue();
+    if (params.contains("on")) {
+        setting.SetValue(params.at("on").get<bool>());
+    }
+    return {{"previous", previous}, {"on", setting.GetValue()}};
+}
+
+json HostTiming(ToolState& state, const json& params) {
+    auto& stats = state.system.CoreTiming().host_wait_stats;
+    const bool previous = stats.load();
+    if (params.contains("stats")) {
+        stats = params.at("stats").get<bool>();
+    }
+    return {{"previous", previous}, {"stats", stats.load()}};
+}
+
 json ReadMemory(ToolState& state, const json& params) {
     const u64 address = AddressParam(params, "address");
     const u64 size = ReadSize(params, address);
@@ -680,6 +700,8 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},
+        {"speed_limit", handler(SpeedLimit)},
+        {"host_timing", handler(HostTiming)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},

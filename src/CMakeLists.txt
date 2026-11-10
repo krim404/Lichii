@@ -87,6 +87,40 @@ if (MSVC AND NOT CXX_CLANG)
     # /Zc:preprocessor    - Enable standards-conforming preprocessor
     # /Zc:throwingNew     - Let codegen assume `operator new` (without std::nothrow) will never return null
     # /GT                 - Supports fiber safety for data allocated using static thread-local storage
+
+    # Diagnostics the project does not accept. ENABLE_WERROR decides whether they are
+    # errors (/we) or warnings at level 4 (/w4), the same way it decides between
+    # -Werror=... and -W... for GCC and Clang below.
+    set(YUZU_MSVC_DIAGNOSTIC_CODES
+        4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
+        4189 # 'identifier': local variable is initialized but not referenced
+        4265 # 'class': class has virtual functions, but destructor is not virtual
+        4388 # 'expression': signed/unsigned mismatch
+        4389 # 'operator': signed/unsigned mismatch
+        4456 # Declaration of 'identifier' hides previous local declaration
+        4457 # Declaration of 'identifier' hides function parameter
+        4458 # Declaration of 'identifier' hides class member
+        4459 # Declaration of 'identifier' hides global declaration
+        4547 # 'operator': operator before comma has no effect; expected operator with side-effect
+        4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
+        4555 # Expression has no effect; expected expression with side-effect
+        4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
+        5038 # data member 'member1' will be initialized after data member 'member2'
+        5233 # explicit lambda capture 'identifier' is not used
+        5245 # 'function': unreferenced function with internal linkage has been removed
+    )
+
+    if (ENABLE_WERROR)
+        set(YUZU_MSVC_DIAGNOSTIC_LEVEL /we)
+    else()
+        set(YUZU_MSVC_DIAGNOSTIC_LEVEL /w4)
+    endif()
+
+    unset(YUZU_MSVC_DIAGNOSTICS)
+    foreach (code IN LISTS YUZU_MSVC_DIAGNOSTIC_CODES)
+        list(APPEND YUZU_MSVC_DIAGNOSTICS ${YUZU_MSVC_DIAGNOSTIC_LEVEL}${code})
+    endforeach()
+
     add_compile_options(
         /MP
         /Zm200
@@ -106,23 +140,8 @@ if (MSVC AND NOT CXX_CLANG)
         /external:anglebrackets # Treats all headers included by #include <header>, where the header file is enclosed in angle brackets (< >), as external headers
         /external:W0            # Sets the default warning level to 0 for external headers, effectively disabling warnings for them.
 
-        /we4062 # Enumerator 'identifier' in a switch of enum 'enumeration' is not handled
-        /we4189 # 'identifier': local variable is initialized but not referenced
-        /we4265 # 'class': class has virtual functions, but destructor is not virtual
-        /we4388 # 'expression': signed/unsigned mismatch
-        /we4389 # 'operator': signed/unsigned mismatch
-        /we4456 # Declaration of 'identifier' hides previous local declaration
-        /we4457 # Declaration of 'identifier' hides function parameter
-        /we4458 # Declaration of 'identifier' hides class member
-        /we4459 # Declaration of 'identifier' hides global declaration
+        ${YUZU_MSVC_DIAGNOSTICS} # /we or /w4, see above
         /w44505 # 'function': unreferenced local function has been removed
-        /we4547 # 'operator': operator before comma has no effect; expected operator with side-effect
-        /we4549 # 'operator1': operator before comma has no effect; did you intend 'operator2'?
-        /we4555 # Expression has no effect; expected expression with side-effect
-        /we4826 # Conversion from 'type1' to 'type2' is sign-extended. This may cause unexpected runtime behavior.
-        /we5038 # data member 'member1' will be initialized after data member 'member2'
-        /we5233 # explicit lambda capture 'identifier' is not used
-        /we5245 # 'function': unreferenced function with internal linkage has been removed
 
         /wd4100 # 'identifier': unreferenced formal parameter
         /wd4324 # 'struct_name': structure was padded due to __declspec(align())
@@ -290,6 +309,10 @@ add_subdirectory(shader_recompiler)
 
 if (YUZU_TESTS)
     add_subdirectory(tests)
+endif()
+
+if (LICHII_FUZZERS)
+    add_subdirectory(fuzz)
 endif()
 
 if (YUZU_CMD)

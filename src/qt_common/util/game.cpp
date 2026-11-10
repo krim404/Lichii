@@ -12,6 +12,7 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/shader_cache_v2/cache.h"
 
 #include <QDesktopServices>
 #include <QStandardPaths>
@@ -243,25 +244,45 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = [&] {
+    using VideoCommon::PipelineCacheClear;
+    const auto result = [&] {
         switch (target) {
         case GameListRemoveTarget::GlShaderCache:
-            return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "opengl", VideoCommon::OpenGLPipelineCacheVersion);
-        case GameListRemoveTarget::VkShaderCache:
-            return VideoCommon::VersionedPipelineCachePath(
-                shader_cache_folder_path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+            return VideoCommon::ClearPipelineCache(shader_cache_folder_path, "opengl",
+                                                   VideoCommon::PipelineCacheMagic, {},
+                                                   VideoCommon::OpenGLPipelineCacheVersion);
+        case GameListRemoveTarget::VkShaderCache: {
+            const auto log = shader_cache_folder_path / VideoCommon::ShaderCacheV2::FileName;
+            const bool had_log = Common::FS::Exists(log);
+            if (had_log && !Common::FS::RemoveFile(log)) {
+                return PipelineCacheClear::Failed;
+            }
+            // The older caches go too, or the next boot starts the log from them again. An empty
+            // one stays in its place when an even older one is on disk.
+            const auto cleared = VideoCommon::ClearPipelineCache(
+                shader_cache_folder_path, "vulkan", VideoCommon::PipelineCacheMagic,
+                VideoCommon::CompatibleVulkanPipelineCacheVersions,
+                VideoCommon::VulkanPipelineCacheVersion);
+            if (cleared == PipelineCacheClear::Cleared) {
+                // Its used list names pipelines that are no longer cached.
+                Common::FS::RemoveFile(VideoCommon::VersionedPipelineCachePath(
+                    shader_cache_folder_path, "vulkan_used",
+                    VideoCommon::VulkanPipelineCacheVersion));
+            }
+            return had_log && cleared == PipelineCacheClear::Missing ? PipelineCacheClear::Cleared
+                                                                     : cleared;
+        }
         default:
-            return std::filesystem::path{};
+            return PipelineCacheClear::Missing;
         }
     }();
 
-    if (!Common::FS::Exists(target_file)) {
+    if (result == PipelineCacheClear::Missing) {
         QtCommon::Frontend::Warning(tr("Error Removing Transferable Shader Cache"),
                                     tr("A shader cache for this title does not exist."));
         return;
     }
-    if (Common::FS::RemoveFile(target_file)) {
+    if (result == PipelineCacheClear::Cleared) {
         QtCommon::Frontend::Information(tr("Successfully Removed"),
                                         tr("Successfully removed the transferable shader cache."));
     } else {
@@ -273,13 +294,21 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
 void RemoveVulkanDriverPipelineCache(u64 program_id) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
-    const auto target_file = VideoCommon::VersionedPipelineCachePath(
-        shader_cache_folder_path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
-
-    if (!Common::FS::Exists(target_file)) {
-        return;
+    // Shader cache v2's driver blobs
+    const auto binaries_file =
+        shader_cache_folder_path / VideoCommon::ShaderCacheV2::DriverFileName;
+    if (Common::FS::Exists(binaries_file) && !Common::FS::RemoveFile(binaries_file)) {
+        QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
+                                    tr("Failed to remove the saved compiled shaders."));
     }
-    if (!Common::FS::RemoveFile(target_file)) {
+
+    // An empty cache stays in its place when an older one is on disk, so the next boot doesn't
+    // start from that one again.
+    if (VideoCommon::ClearPipelineCache(shader_cache_folder_path, "vulkan_pipelines",
+                                        VideoCommon::VulkanDriverPipelineCacheMagic,
+                                        VideoCommon::CompatibleVulkanPipelineCacheVersions,
+                                        VideoCommon::VulkanPipelineCacheVersion) ==
+        VideoCommon::PipelineCacheClear::Failed) {
         QtCommon::Frontend::Warning(tr("Error Removing Vulkan Driver Pipeline Cache"),
                                     tr("Failed to remove the driver pipeline cache."));
     }

@@ -120,7 +120,7 @@ The following are optional to define:
 - `bundled`: Force the usage of a bundled package. Useful for packages where the system package is broken or nonexistent; e.g. external fragment shaders or data archives.
   - Note that this will conflict with `CPMUTIL_FORCE_SYSTEM`; for this reason, when using non-library archives, it may be best to allow the user to download and extract the archive manually and specify a local directory to it.
 - `find_args`: Additional arguments passed to `find_package`, e.g. `MODULE`
-- `patches`: Array of in-tree patches to apply to the downloaded source code. See [#Patches](TODO).
+- `patches`: Array of in-tree patches to apply to the downloaded source code. See [Patches](#patches).
 - `options`: Array of CMake options to apply before configuring the package, e.g. `"FMT_TEST ON"`.
 
 ### Versioning
@@ -203,6 +203,8 @@ To use them, you must add `ci: true` to your package definition. Alongside the c
   - This is subject to change.
 
 **Note that `package` is subject to removal here.**
+
+CI packages take their SHA512 from the artifact's `.sha512sum` release file. Once a package is in the cache, the hash it was verified against is kept in `.cpm_archive_sha512` next to it and used instead, so configuring doesn't need the release host. Caches made before this file existed get it on the next configure that can reach the host.
 
 Example:
 

@@ -65,6 +65,7 @@ add_library(video_core STATIC
     render_trace.h
     fsr.cpp
     fsr.h
+    fsr4_support.h
     game_dlss_status.cpp
     game_dlss_status.h
     host1x/codecs/decoder.cpp
@@ -111,14 +112,21 @@ add_library(video_core STATIC
     memory_manager.cpp
     memory_manager.h
     page_filter.h
+    native_lowering.cpp
+    native_lowering.h
     native_qmd.h
     native_query_trace.h
     nx2.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_fast_draw.cpp
+    nx2_fast_draw.h
     nx2_profile.h
+    nx2_stutter_trace.cpp
+    nx2_stutter_trace.h
     nx2_perf.h
+    nx2_async_readback.h
     nx2_download_trace.h
     pending_maps.h
     present.h
@@ -171,6 +179,8 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_failure.cpp
+    renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
@@ -190,6 +200,11 @@ add_library(video_core STATIC
     renderer_vulkan/vk_compute_pass.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
+    renderer_vulkan/vk_fsr4_upscaler.cpp
+    renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/ffx_files.h
+    vulkan_common/ffx_runtime.cpp
+    vulkan_common/ffx_runtime.h
     renderer_vulkan/vk_dlss_network_probe.cpp
     renderer_vulkan/vk_dlss_network_probe.h
     renderer_vulkan/vk_ocarina_camera_motion.cpp
@@ -214,6 +229,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_master_semaphore.h
     renderer_vulkan/vk_pipeline_cache.cpp
     renderer_vulkan/vk_pipeline_cache.h
+    renderer_vulkan/vk_pipeline_cache_records.cpp
+    renderer_vulkan/vk_pipeline_cache_records.h
+    renderer_vulkan/vk_pipeline_binaries.cpp
+    renderer_vulkan/vk_pipeline_binaries.h
+    renderer_vulkan/vk_shader_cache_v2.cpp
+    renderer_vulkan/vk_shader_cache_v2.h
     renderer_vulkan/vk_present_manager.cpp
     renderer_vulkan/vk_present_manager.h
     renderer_vulkan/vk_query_cache.cpp
@@ -221,6 +242,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_rasterizer.cpp
     renderer_vulkan/vk_rasterizer.h
     renderer_vulkan/submission_policy.h
+    renderer_vulkan/upload_batch.h
     renderer_vulkan/vk_render_pass_cache.cpp
     renderer_vulkan/vk_render_pass_cache.h
     renderer_vulkan/vk_resource_pool.cpp
@@ -253,6 +275,7 @@ add_library(video_core STATIC
     vulkan_common/vulkan_library.cpp
     vulkan_common/vulkan_library.h
     vulkan_common/vulkan_overlay_filter.h
+    vulkan_common/unbacked_fallback.h
     vulkan_common/vulkan_memory_allocator.cpp
     vulkan_common/vulkan_memory_allocator.h
     vulkan_common/vulkan_surface.cpp
@@ -267,11 +290,35 @@ add_library(video_core STATIC
 
     shader_cache.cpp
     shader_cache.h
+    shader_cache_v2/cache.cpp
+    shader_cache_v2/cache.h
+    shader_cache_v2/cache_file.cpp
+    shader_cache_v2/cache_file.h
+    shader_cache_v2/cache_format.cpp
+    shader_cache_v2/cache_format.h
+    shader_cache_v2/cache_writer.cpp
+    shader_cache_v2/cache_writer.h
+    shader_cache_v2/driver_blobs.cpp
+    shader_cache_v2/driver_blobs.h
+    shader_cache_v2/payload_io.h
+    shader_cache_v2/records.cpp
+    shader_cache_v2/records.h
     shader_environment.cpp
     shader_environment.h
+    evicted_pointer_slots.h
     shader_handle_program.h
+    shader_jobs.cpp
+    shader_jobs.h
     shader_notify.cpp
     shader_notify.h
+    shader_stage_translation.cpp
+    shader_stage_translation.h
+    shader_warm/shader_archives.cpp
+    shader_warm/shader_archives.h
+    shader_warm/shader_warm_builder.cpp
+    shader_warm/shader_warm_builder.h
+    shader_warm/warm_records.cpp
+    shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
@@ -287,6 +334,8 @@ add_library(video_core STATIC
     texture_cache/format_lookup_table.h
     texture_cache/image_base.cpp
     texture_cache/image_base.h
+    texture_cache/host_memory_limit.h
+    texture_cache/host_mip_limits.h
     texture_cache/image_info.cpp
     texture_cache/image_info.h
     texture_cache/image_view_base.cpp
@@ -295,6 +344,7 @@ add_library(video_core STATIC
     texture_cache/image_view_info.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
+    texture_cache/stale_pages.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h
@@ -460,6 +510,31 @@ target_link_libraries(video_core PUBLIC common core)
 if(WIN32)
     target_link_libraries(video_core PRIVATE advapi32)
 endif()
+
+# Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
+target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
+
+# Shader cache v2: record checksums, and a hash of the native lowering sources made at build time,
+# so that a record lowered by another lowering is told apart (ShaderCacheV2::LoweringStamp).
+target_link_libraries(video_core PRIVATE xxhash)
+cmake_path(GET CMAKE_CURRENT_SOURCE_DIR PARENT_PATH lowering_source_dir)
+file(GLOB_RECURSE lowering_sources CONFIGURE_DEPENDS RELATIVE "${lowering_source_dir}"
+     "${lowering_source_dir}/shader_recompiler/frontend/ampere/*")
+list(APPEND lowering_sources video_core/mkw_wave_workaround.h video_core/native_lowering.cpp
+     video_core/native_lowering.h)
+list(SORT lowering_sources)
+list(TRANSFORM lowering_sources PREPEND "${lowering_source_dir}/" OUTPUT_VARIABLE lowering_inputs)
+string(REPLACE ";" "|" lowering_list "${lowering_sources}")
+set(lowering_stamp "${CMAKE_CURRENT_BINARY_DIR}/generated/video_core/shader_cache_v2/lowering_stamp.h")
+add_custom_command(
+    OUTPUT "${lowering_stamp}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${lowering_source_dir}" "-DFILES=${lowering_list}"
+            "-DOUTPUT=${lowering_stamp}"
+            -P "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    DEPENDS ${lowering_inputs} "${PROJECT_SOURCE_DIR}/CMakeModules/GenerateShaderLoweringStamp.cmake"
+    VERBATIM)
+target_sources(video_core PRIVATE "${lowering_stamp}")
+target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
@@ -476,6 +551,12 @@ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
+# AMD's FFX API headers (MIT), for calling AMD's FSR 4 runtime (vk_fsr4_upscaler.cpp).
+target_include_directories(video_core PRIVATE ${CMAKE_SOURCE_DIR}/externals/ffx-api)
+if (WIN32)
+    # Checks AMD's downloaded FSR 4 runtime (vulkan_common/ffx_runtime.cpp).
+    target_link_libraries(video_core PRIVATE bcrypt wintrust crypt32)
+endif()
 
 target_link_libraries(video_core PRIVATE sirit::sirit)
 

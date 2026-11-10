@@ -9,6 +9,8 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#elif defined(_WIN32)
+#include "common/windows/timer_resolution.h"
 #endif
 
 #include "common/assert.h"
@@ -54,7 +56,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     rasterizer = renderer.ReadRasterizer();
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
+        const VideoCommon::StutterTrace::ThreadScope stutter_thread{
+            VideoCommon::StutterTrace::Thread::Front};
         Common::SetCurrentThreadName("GPU");
+        VideoCommon::GpuSplit::MarkGpuThread();
 #ifdef __linux__
         // The pending-channel polls below sleep 50 us; the default timer slack adds up to 50 more.
         prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
@@ -75,24 +80,41 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
+            if (VideoCommon::g_acquire_counting) {
+                split.ReportAcquire();
+            }
             if (scheduler.HasPendingChannels()) {
                 // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                bool resumed = false;
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
-                    scheduler.ResumePending(system.GPU());
+                    resumed = scheduler.ResumePending(system.GPU());
+                }
+                if (resumed) {
+                    last_progress = std::chrono::steady_clock::now();
                 }
                 if (!state.queue.TryPop(next)) {
+                    if (!scheduler.HasPendingChannels()) {
+                        continue;
+                    }
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond, then in short sleeps. Ocarina of Time waits here ~330 times a
                     // second and its present waits for the work behind them: with 1 ms sleeps the
                     // present waited ~17 ms a frame in Kokiri village, with 50 us ~1 ms. A channel
                     // still waiting after 2 s (menus, loading) goes back to 1 ms sleeps.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    split.SettleIdleBack();
                     const auto waited = std::chrono::steady_clock::now() - last_progress;
                     if (waited < std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else if (waited < std::chrono::seconds{2}) {
+#ifdef _WIN32
+                        // sleep_for(50us) rounds up to Sleep(1) (>= 1 ms) on Windows;
+                        // SleepForOneTick uses NtDelayExecution(-1) for one high-res timer tick.
+                        Common::Windows::SleepForOneTick();
+#else
                         std::this_thread::sleep_for(std::chrono::microseconds{50});
+#endif
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     }
@@ -105,7 +127,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (stop_token.stop_requested()) {
                 break;
             }
-            last_progress = std::chrono::steady_clock::now();
             if (split.Active()) {
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
@@ -114,7 +135,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Profile::Scope scope{Profile::Zone::Push};
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                    // TickWork ends fast draw reuse itself when it runs a request.
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); },
+                                VideoCommon::GpuSplit::FastDrawNeutral);
                 } else if (auto* run = std::get_if<RunCommand>(&next.data)) {
                     if (run->before_later_reads) {
                         // GPU memory maps unmap caches (UnmapMemory downloads): the back's state.
@@ -136,8 +159,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);
-                });
+                }, VideoCommon::GpuSplit::FastDrawNeutral);
                 split.Publish();
+                last_progress = std::chrono::steady_clock::now();
                 continue;
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
@@ -159,6 +183,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 ASSERT(false);
             }
             SignalCommand(state, next.fence, next.block);
+            last_progress = std::chrono::steady_clock::now();
         }
     });
 }
