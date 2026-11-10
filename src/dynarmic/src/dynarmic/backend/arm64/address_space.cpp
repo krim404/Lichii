@@ -71,8 +71,7 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         return block_entry;
     }
     GenerateIR(ir_block, descriptor);
-    const EmittedBlockInfo block_info = Emit(std::move(ir_block));
-    return block_info.entry_point;
+    return Emit(std::move(ir_block));
 }
 
 void AddressSpace::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& descriptors) {
@@ -106,7 +105,7 @@ std::size_t AddressSpace::GetRemainingSize() {
     return code_cache_size - static_cast<std::size_t>(code.offset());
 }
 
-EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+CodePtr AddressSpace::Emit(IR::Block block) {
     if (GetRemainingSize() < 1024 * 1024) {
         ClearCache();
     }
@@ -117,17 +116,20 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
 
     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
     ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
-    ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
+    const auto entry_point = block_info.entry_point;
+    const auto [info_iter, inserted] = block_infos.emplace(entry_point, std::move(block_info));
+    ASSERT(inserted);
+    EmittedBlockInfo& stored_info = info_iter->second;
 
-    Link(block_info);
-    RelinkForDescriptor(block.Location(), block_info.entry_point);
+    Link(stored_info);
+    RelinkForDescriptor(block.Location(), entry_point);
 
-    mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+    mem.invalidate(reinterpret_cast<u32*>(entry_point), stored_info.size);
     ProtectCodeMemory();
 
-    RegisterNewBasicBlock(block, block_info);
+    RegisterNewBasicBlock(block, stored_info);
 
-    return block_info;
+    return entry_point;
 }
 
 void AddressSpace::Link(EmittedBlockInfo& block_info) {
@@ -270,7 +272,7 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         }
     }
 
-    for (auto [target_descriptor, list] : block_info.block_relocations) {
+    for (const auto& [target_descriptor, list] : block_info.block_relocations) {
         block_references[target_descriptor].insert(block_info.entry_point);
         LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
     }

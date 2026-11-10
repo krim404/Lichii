@@ -769,7 +769,7 @@ private:
     /// EDEN_NX2_TABLE_POINTER_TRACE: last table entry and size bound per table pointer slot.
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
-    u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
+    u64 buffer_bytes = 0; ///< The buffers' allocated size (total_used_memory may be the device's)
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     BufferId inline_buffer_id;

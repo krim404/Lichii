@@ -15,6 +15,7 @@
 #include <span>
 #include <type_traits>
 #include "common/container/unordered_map.h"
+#include "common/container/unordered_set.h"
 #include <vector>
 
 #include "common/common_types.h"
@@ -44,6 +45,10 @@ struct LoweredNativeCode {
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
 };
+
+/// Thrown by a detached GraphicsEnvironment asked what its snapshot does not hold: the pipeline
+/// is translated on the GPU thread instead.
+struct DetachedEnvironmentMiss {};
 
 class GenericEnvironment : public Shader::Environment {
 public:
@@ -126,6 +131,9 @@ protected:
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                              bool via_header_index, u32 raw);
 
+    /// Whether `address` is a mapped GPU address.
+    [[nodiscard]] bool IsMappedGpuAddress(u64 address) const;
+
     Tegra::MemoryManager* gpu_memory{};
     GPUVAddr program_base{};
 
@@ -177,9 +185,55 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
+
+    bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
+
+    /// Copies what translation reads from the 3D engine and guest memory and stops using both,
+    /// so the program can be translated on a worker thread while the GPU thread moves on.
+    /// `texture_pool` is shared by the environments of one pipeline: the first Detach copies the
+    /// pool into it. Returns false, leaving the environment attached, when the pool is larger
+    /// than MaxDetachedTexturePoolBytes or the program is not lowered native code.
+    [[nodiscard]] bool Detach(
+        std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>>& texture_pool);
+
+    static constexpr size_t MaxDetachedTexturePoolBytes = 1024 * 1024;
+
+    /// Bytes of constant buffer contents copied by Detach (0 if not detached).
+    [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;
+
 private:
+    /// The 3D engine state a detached environment reads instead of the engine.
+    struct EngineSnapshot {
+        struct ConstBuffer {
+            bool enabled{};
+            u32 size{};
+            /// Contents when the environment was detached, one word longer than `size` so a
+            /// read at any offset below `size` stays inside the copy.
+            std::vector<u32> words;
+        };
+        std::array<ConstBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> const_buffers;
+
+        std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>> texture_pool;
+        u32 texture_pool_limit{};
+        bool via_header_index{};
+        bool native_tiling{};
+
+        /// Keys (index, offset) of the 4-byte aligned constant buffer slots whose 8 bytes were a
+        /// mapped GPU address.
+        ::Common::unordered_set<u64> mapped_pointers;
+
+        u32 viewport_scale_offset_enabled{};
+        ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType>
+            replace_table;
+    };
+
+    /// Texture descriptor (TIC entry) of a texture handle, from the engine or the snapshot.
+    Tegra::Texture::TICEntry ReadTextureDescriptor(u32 handle);
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
+    std::optional<EngineSnapshot> snapshot;
 };
 
 class ComputeEnvironment final : public GenericEnvironment {

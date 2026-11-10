@@ -13,8 +13,9 @@
 #include <memory>
 #include <vector>
 
+#include <boost/container/flat_map.hpp>
+
 #include "common/common_types.h"
-#include "common/container/unordered_map.h"
 
 #include "dynarmic/backend/arm64/fastmem.h"
 #include "dynarmic/interface/A32/coprocessor.h"
@@ -105,8 +106,8 @@ struct EmittedBlockInfo {
     CodePtr entry_point;
     std::size_t size;
     std::vector<Relocation> relocations;
-    ::Common::unordered_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
-    ::Common::unordered_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
+    boost::container::flat_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
+    boost::container::flat_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
 };
 
 struct EmitConfig {

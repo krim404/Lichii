@@ -58,6 +58,8 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/fire_emblem_upscale.cpp
+    video_core/query_copy.cpp
+    video_core/shader_reuse.cpp
     video_core/dlss_contract.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
@@ -69,6 +71,7 @@ add_executable(tests
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
+    video_core/mesh_fallback.cpp
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_written_pages.cpp
