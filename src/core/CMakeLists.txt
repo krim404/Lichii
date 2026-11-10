@@ -1212,6 +1212,10 @@ if (WIN32)
     endif()
 endif()
 
+if (APPLE)
+    target_link_libraries(core PRIVATE "-framework SystemConfiguration" "-framework CoreFoundation")
+endif()
+
 if (MSVC)
     target_compile_options(core PRIVATE
         /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
