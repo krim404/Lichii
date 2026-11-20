@@ -7,6 +7,8 @@
 #include <QWidget>
 #include "common/settings_enums.h"
 
+class QLineEdit;
+
 namespace Core {
 class System;
 }
@@ -51,6 +53,7 @@ private:
     void UpdateWidthText();
 
     std::unique_ptr<Ui::ConfigureUi> ui;
+    QLineEdit* steamgriddb_key_edit = nullptr;
 
     Settings::AspectRatio ratio;
     Settings::ResolutionSetup resolution_setting;

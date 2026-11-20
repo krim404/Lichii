@@ -66,6 +66,8 @@ public:
 
     Errno SetReuseAddr(bool enable) override;
 
+    Errno SetReusePort(bool enable) override;
+
     Errno SetBroadcast(bool enable) override;
 
     Errno SetKeepAlive(bool enable) override;
@@ -82,12 +84,18 @@ public:
 
     Errno SetNonBlock(bool enable) override;
 
+    Errno SetIpv6Option(Ipv6Option option, s32 value) override;
+
+    std::pair<s32, Errno> GetIpv6Option(Ipv6Option option) override;
+
     template <typename T>
     Errno SetSockOpt(SOCKET fd, int option, T value);
 
     std::pair<Errno, Errno> GetPendingError() override;
 
     std::pair<bool, Errno> GetReuseAddr() override;
+
+    std::pair<bool, Errno> GetReusePort() override;
 
     std::pair<bool, Errno> GetNoDelay() override;
 
@@ -104,6 +112,7 @@ private:
 
     bool broadcast = false;
     bool reuse_addr = false;
+    bool reuse_port = false;
     bool no_delay = false;
     bool closed = false;
     u32 send_timeout = 0;

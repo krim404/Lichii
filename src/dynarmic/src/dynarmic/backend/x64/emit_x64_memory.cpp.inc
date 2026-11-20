@@ -59,13 +59,14 @@ void AxxEmitX64::AddFastmemPatch(CodePtr location, CodePtr resume_location, void
     fastmem_patch_info.insert(it, info);
 }
 
-FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
+std::optional<FakeCall> AxxEmitX64::FastmemCallback(u64 rip_) {
     const u64 base = std::bit_cast<u64>(code.getCode());
     const auto iter = rip_ >= base && rip_ - base <= UINT32_MAX
                         ? std::lower_bound(fastmem_patch_info.begin(), fastmem_patch_info.end(), u32(rip_ - base),
                                            [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; })
                         : fastmem_patch_info.end();
     if (iter != fastmem_patch_info.end() && iter->rip == u32(rip_ - base)) {
+        RecordFastmemFault(conf, iter->recompile);
         FakeCall result{
             .call_rip = base + iter->callback,
             .ret_rip = base + iter->resume_rip,
@@ -77,9 +78,7 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
         }
         return result;
     }
-    fmt::print("dynarmic: Segfault happened within JITted code at rip = {:016x}\n"
-        "Segfault wasn't at a fastmem patch location!\n", rip_);
-    UNREACHABLE(); //("iter != fastmem_patch_info.end()");
+    return std::nullopt;
 }
 
 template<std::size_t bitsize, auto callback>

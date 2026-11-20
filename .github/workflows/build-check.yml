@@ -2,7 +2,7 @@ name: build-check
 
 on:
   pull_request:
-    branches: [nx2]
+    branches: [nx2, 'capy/nce-*']
   push:
     branches: [nx2]
   workflow_dispatch:
@@ -67,7 +67,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev ccache pipx \
+            libopus-dev libasound2-dev ccache pipx mesa-vulkan-drivers \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
             libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
           pipx install cmake==4.4.4
@@ -80,7 +80,7 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # Objects are keyed by content, so the newest cache of this branch or nx2 always helps;
@@ -130,10 +130,18 @@ jobs:
       - name: Test debug adapter
         run: python3 tools/nx2/test_debug_mcp.py
 
+      # docs/nx2/gpu-trace.md: the corpus replays headless on Mesa's CPU Vulkan driver.
+      - name: Replay GPU traces on lavapipe
+        run: |
+          python3 tools/nx2/test_trace_replay.py
+          python3 -I tools/nx2/trace_replay.py check --cli build/bin/eden-cli \
+            --corpus tests/gpu_traces/corpus.json
+
       - name: Test cache metrics and bench
         run: |
           python3 tools/nx2/test_cache_metrics.py
           python3 tools/nx2/test_cache_bench.py
+          python3 tools/nx2/test_cache_records.py
 
       - name: Test ThreadWorker wake-ups
         run: |
@@ -154,6 +162,130 @@ jobs:
             .cache/cpm
             .ccache
           key: gcc13-qt683-${{ runner.os }}-${{ github.sha }}
+
+  linux-arm64-nce:
+    name: Linux ARM64 NCE build and synthetic guests
+    needs: changes
+    if: needs.changes.outputs.build == 'true' && (startsWith(github.head_ref, 'capy/nce-') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(getconf PAGESIZE)" = 4096
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf g++-13 git glslang-tools libpulse-dev libtool libudev-dev \
+            ninja-build libavfilter-dev libavcodec-dev libswscale-dev pkg-config \
+            zlib1g-dev libva-dev libvdpau-dev spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev ccache pipx
+          pipx install cmake==4.4.4
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore ARM64 dependencies and compiler objects
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: gcc13-arm64-nce-${{ github.sha }}
+          restore-keys: |
+            gcc13-arm64-nce-
+
+      - name: Configure headless build and tests
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-13 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DENABLE_WERROR=ON \
+            -DBUILD_TESTING=ON \
+            -DLICHII_TESTS=ON \
+            -DENABLE_QT=OFF \
+            -DENABLE_OPENGL=OFF \
+            -DLICHII_CMD=OFF \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DUSE_CCACHE=ON
+
+      - name: Build and run NCE and JIT tests
+        run: |
+          cmake --build build --parallel "$(nproc)" --target config_tests arm_cpu_guest_tests
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^config_tests$|^arm_cpu_guest_'
+
+      - name: Compare native dispatch with Dynarmic
+        run: |
+          for backend in nce dynarmic dynarmic nce; do
+            build/bin/arm_cpu_guest_tests "$backend" --benchmark
+          done
+
+      - name: Save ARM64 dependencies and compiler objects
+        if: always()
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: gcc13-arm64-nce-${{ github.sha }}
+
+  macos-arm64-hypervisor:
+    name: Apple Silicon Hypervisor build and signing
+    needs: changes
+    if: needs.changes.outputs.build == 'true' && startsWith(github.head_ref, 'capy/nce-macos')
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          test "$(uname -m)" = arm64
+          brew install autoconf automake boost cmake ffmpeg fmt glslang hidapi libtool \
+            libusb lz4 molten-vk ninja nlohmann-json openssl pkg-config sdl3 speexdsp \
+            spirv-tools vulkan-loader zlib zstd
+
+      - name: Configure headless build and tests
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_TESTING=ON -DLICHII_TESTS=ON \
+            -DENABLE_QT=OFF -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF -DLICHII_ROOM_STANDALONE=OFF \
+            "-DCMAKE_PREFIX_PATH=$(brew --prefix zlib)" \
+            "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
+            -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+
+      - name: Build and verify both executable signatures
+        run: |
+          cmake --build build --parallel 3 --target arm_cpu_guest_tests lichii-cmd
+          for binary in build/bin/arm_cpu_guest_tests build/bin/eden-cli; do
+            codesign --verify --strict "$binary"
+            codesign -d --entitlements - "$binary" | grep -F com.apple.security.hypervisor
+            if otool -L "$binary" | grep -F /usr/lib/libhvf.dylib; then
+              exit 1
+            fi
+          done
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^arm_cpu_guest_dynarmic$'
 
   windows-clang-cl:
     name: Windows clang-cl production build and tests
@@ -190,7 +322,7 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       - name: Install ccache

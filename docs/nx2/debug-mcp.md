@@ -113,8 +113,10 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 - **Writes only under the dump directory.** `EDEN_NX2_DEBUG_DIR`, by default
   `<log dir>/debug-server`. Clients never send paths. The server names every file itself:
   `capture-<session>-<n>/`, `screenshot-<session>-<n>.png`.
-- **Nothing the server returns comes from game files, keys or firmware.** It returns rendered
-  pixels, log lines, frame-dump manifests and shader hashes, which the owner already sends today.
+- **Captures and memory reads can contain game data.** Frame captures, bug bundles and memory
+  reads can expose game code, shaders, textures, buffers and personal information. Do not publish
+  them or add them to the repository. Ask a maintainer for handling instructions before sharing
+  the minimum necessary material, and share only what you have permission to disclose.
   The memory tools read only the application's guest virtual memory and GPU virtual memory,
   through their page tables, and never write either. They cannot reach host memory, the key area
   or the file system: an address resolves only through a page the guest has mapped. The adapter's `capture_image` reads only PNGs inside
@@ -340,7 +342,10 @@ or setting, so it works with whatever the owner has mapped and leaves nothing be
 goes to player 1, or to the handheld controller when player 1 is not connected; the result names
 which. When no injector is installed, each getter costs one atomic load.
 
-Timing is by presents, not wall time. `RunInput` starts the script at `g_nx2_present_count + 1`,
+Timing is by presents, not wall time. Switch 1 advances the counter when a newly acquired,
+visible game buffer is composed; overlay-only updates and cached-buffer repeats do not count.
+Switch 2 advances it on vi2 present calls. Generated display frames do not count.
+`RunInput` starts the script at `g_nx2_present_count + 1`,
 the next present. The injector looks up the active step from the present count at every read
 (`InputAt`), so a step changes at the first npad update after its present: the npad updates
 every 1 ms (`src/hid_core/resource_manager.cpp:48`). A slow frame stretches the step in time but

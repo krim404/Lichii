@@ -216,6 +216,22 @@
       </layout>
      </item>
      <item>
+      <widget class="QLabel" name="labelDeviceWarning">
+       <property name="visible">
+        <bool>false</bool>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #e0a000;</string>
+       </property>
+       <property name="wordWrap">
+        <bool>true</bool>
+       </property>
+       <property name="textInteractionFlags">
+        <set>Qt::TextSelectableByMouse</set>
+       </property>
+      </widget>
+     </item>
+     <item>
       <widget class="QFrame" name="bottom">
        <property name="sizePolicy">
         <sizepolicy hsizetype="Preferred" vsizetype="MinimumExpanding">

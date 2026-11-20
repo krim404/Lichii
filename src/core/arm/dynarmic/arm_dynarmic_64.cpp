@@ -19,14 +19,41 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
+#include "video_core/nx2_stutter_trace.h"
 
 namespace Core {
 
 using namespace Common::Literals;
 
 namespace {
-// EDEN_NX2_GUEST_THREAD_STATS: the JIT's dispatcher counters of each core's JITs (one per process).
+// EDEN_NX2_GUEST_THREAD_STATS and EDEN_NX2_STUTTER_TRACE: the JIT's dispatcher counters of each
+// core's JITs (one per process).
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
+// EDEN_NX2_STUTTER_TRACE: each core's counters already added to the stutter trace.
+std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_traced{};
+
+void TraceJit(size_t core) {
+    const auto& now = g_jit_counters[core];
+    auto& traced = g_jit_traced[core];
+    if (now.blocks_compiled == traced.blocks_compiled && now.cache_clears == traced.cache_clears &&
+        now.blocks_invalidated == traced.blocks_invalidated &&
+        now.fastmem_recompiles == traced.fastmem_recompiles) {
+        return;
+    }
+    VideoCommon::StutterTrace::AddJit(
+        core,
+        {
+            .compile_ns = now.compile_ns - traced.compile_ns,
+            .blocks = now.blocks_compiled - traced.blocks_compiled,
+            .clears = now.cache_clears - traced.cache_clears,
+            .full_clears = now.full_clears - traced.full_clears,
+            .invalidated = now.blocks_invalidated - traced.blocks_invalidated,
+            .invalidated_bytes = now.invalidated_bytes - traced.invalidated_bytes,
+            .fastmem_recompiles = now.fastmem_recompiles - traced.fastmem_recompiles,
+        },
+        now.code_bytes);
+    traced = now;
+}
 } // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
@@ -65,9 +92,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -473,7 +502,8 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
-    if (Kernel::Nx2ThreadStats::g_enabled && m_core_index < g_jit_counters.size()) {
+    if ((Kernel::Nx2ThreadStats::g_enabled || VideoCommon::StutterTrace::Enabled()) &&
+        m_core_index < g_jit_counters.size()) {
         config.counters = &g_jit_counters[m_core_index];
     }
 #if defined(ARCHITECTURE_x86_64)
@@ -521,8 +551,15 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    if (!Kernel::Nx2ThreadStats::g_enabled || m_core_index >= g_jit_counters.size()) {
+    if (m_core_index >= g_jit_counters.size()) {
         return TranslateHaltReason(m_jit->Run());
+    }
+    if (!Kernel::Nx2ThreadStats::g_enabled) {
+        const Dynarmic::HaltReason hr = m_jit->Run();
+        if (VideoCommon::StutterTrace::Enabled()) {
+            TraceJit(m_core_index);
+        }
+        return TranslateHaltReason(hr);
     }
     namespace Stats = Kernel::Nx2ThreadStats;
     auto& timing = m_system.CoreTiming();
@@ -537,7 +574,10 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
                                  : Stats::Exit::Other;
     const auto& jit = g_jit_counters[m_core_index];
     Stats::EndRun(thread, m_core_index, start, end, exit, m_svc, jit.block_lookups,
-                  jit.blocks_compiled, jit.cache_clears);
+                  jit.blocks_compiled, jit.cache_clears, jit.fastmem_faults, jit.fastmem_recompiles);
+    if (VideoCommon::StutterTrace::Enabled()) {
+        TraceJit(m_core_index);
+    }
     return TranslateHaltReason(hr);
 }
 
@@ -572,7 +612,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -627,7 +667,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -635,7 +675,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

@@ -305,6 +305,20 @@ TEST_CASE("Bound descriptor IDs refresh after descriptor capacity changes", "[de
     }
 }
 
+TEST_CASE("Descriptor indices must fit both the guest limit and allocated table",
+          "[descriptor_table]") {
+    VideoCommon::DescriptorTable<u64> table;
+    CHECK_FALSE(table.ContainsIndex(0));
+
+    REQUIRE(table.Synchronize(0x1000, 127));
+    CHECK(table.ContainsIndex(127));
+    CHECK_FALSE(table.ContainsIndex(128));
+
+    REQUIRE(table.Synchronize(0x1000, (std::numeric_limits<u32>::max)()));
+    CHECK(table.ContainsIndex(0));
+    CHECK_FALSE(table.ContainsIndex(static_cast<u32>(table.bound_ids.size())));
+}
+
 TEST_CASE("Descriptor Debug poisoning touches only the current addressable range",
           "[descriptor_table]") {
     DescriptorMemory memory;

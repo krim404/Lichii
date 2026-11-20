@@ -298,7 +298,7 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
       player_index{player_index_}, debug{debug_}, is_powered_on{is_powered_on_},
       input_subsystem{input_subsystem_}, profiles(profiles_),
       timeout_timer(std::make_unique<QTimer>()), poll_timer(std::make_unique<QTimer>()),
-      bottom_row{bottom_row_}, hid_core{hid_core_} {
+      device_warning_timer(std::make_unique<QTimer>()), bottom_row{bottom_row_}, hid_core{hid_core_} {
     if (player_index == 0) {
         auto* emulated_controller_p1 =
             hid_core.GetEmulatedController(Core::HID::NpadIdType::Player1);
@@ -809,6 +809,10 @@ ConfigureInputPlayer::ConfigureInputPlayer(QWidget* parent, std::size_t player_i
         }
     });
 
+    connect(device_warning_timer.get(), &QTimer::timeout, this,
+            &ConfigureInputPlayer::UpdateDeviceWarning);
+    device_warning_timer->start(1000);
+
     UpdateInputProfiles();
 
     connect(ui->buttonProfilesNew, &QPushButton::clicked, this,
@@ -853,6 +857,15 @@ void ConfigureInputPlayer::ApplyConfiguration() {
     emulated_controller->DisableConfiguration();
     emulated_controller->SaveCurrentConfig();
     emulated_controller->EnableConfiguration();
+}
+
+void ConfigureInputPlayer::RestoreConfiguration() {
+    if (player_index == 0) {
+        hid_core.GetEmulatedController(Core::HID::NpadIdType::Player1)->RestoreConfig();
+        hid_core.GetEmulatedController(Core::HID::NpadIdType::Handheld)->RestoreConfig();
+        return;
+    }
+    emulated_controller->RestoreConfig();
 }
 
 void ConfigureInputPlayer::showEvent(QShowEvent* event) {
@@ -1174,6 +1187,27 @@ void ConfigureInputPlayer::UpdateInputDevices() {
     for (const auto& device : input_devices) {
         ui->comboDevices->addItem(QString::fromStdString(device.Get("display", "Unknown")), {});
     }
+}
+
+void ConfigureInputPlayer::UpdateDeviceWarning() {
+    if (!isVisible()) {
+        return;
+    }
+    std::string warning;
+    const int index = ui->comboDevices->currentIndex();
+    if (index >= 0 && static_cast<std::size_t>(index) < input_devices.size()) {
+        warning = input_subsystem->GetDeviceWarning(input_devices[index]);
+    }
+    if (warning.empty()) {
+        for (const auto& device : emulated_controller->GetMappedDevices()) {
+            warning = input_subsystem->GetDeviceWarning(device);
+            if (!warning.empty()) {
+                break;
+            }
+        }
+    }
+    ui->labelDeviceWarning->setText(QString::fromStdString(warning));
+    ui->labelDeviceWarning->setVisible(!warning.empty());
 }
 
 void ConfigureInputPlayer::UpdateControllerAvailableButtons() {

@@ -11,7 +11,7 @@
 namespace Service {
 
 /// Owns one guest-fence callback until it fires or its waiter leaves. Deregistration also
-/// joins a callback already running under the syncpoint manager's action lock.
+/// joins a callback that is already running.
 class Nx2ScopedGuestFenceAction final {
 public:
     template <typename Callback>

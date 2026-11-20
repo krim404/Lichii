@@ -530,6 +530,67 @@
         </property>
        </widget>
       </item>
+      <item>
+       <layout class="QHBoxLayout" name="triggerRumbleLayout">
+        <item>
+         <widget class="QCheckBox" name="checkBoxTriggerRumble">
+          <property name="toolTip">
+           <string>On controllers with motors in their triggers, also play the light part of the HD Rumble on them: the left side on the left trigger, the right side on the right one. 20% is a good start.</string>
+          </property>
+          <property name="text">
+           <string>Trigger rumble</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QSpinBox" name="spinTriggerRumble">
+          <property name="minimumSize">
+           <size>
+            <width>68</width>
+            <height>21</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>68</width>
+            <height>16777215</height>
+           </size>
+          </property>
+          <property name="toolTip">
+           <string>On controllers with motors in their triggers, also play the light part of the HD Rumble on them: the left side on the left trigger, the right side on the right one. 20% is a good start.</string>
+          </property>
+          <property name="suffix">
+           <string>%</string>
+          </property>
+          <property name="minimum">
+           <number>1</number>
+          </property>
+          <property name="maximum">
+           <number>100</number>
+          </property>
+          <property name="value">
+           <number>20</number>
+          </property>
+          <property name="singleStep">
+           <number>5</number>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <spacer name="spacerTriggerRumble">
+          <property name="orientation">
+           <enum>Qt::Horizontal</enum>
+          </property>
+          <property name="sizeHint" stdset="0">
+           <size>
+            <width>40</width>
+            <height>20</height>
+           </size>
+          </property>
+         </spacer>
+        </item>
+       </layout>
+      </item>
      </layout>
     </widget>
    </item>

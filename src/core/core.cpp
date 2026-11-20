@@ -4,6 +4,7 @@
 #include <optional>
 #include <array>
 #include <cstdlib>
+#include <chrono>
 #include <atomic>
 #include <memory>
 #include <new>
@@ -18,6 +19,7 @@
 #include "common/memory_detect.h"
 #include "common/nx2_sampler.h"
 #include "common/adpf.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/shutdown_progress.h"
@@ -50,6 +52,7 @@
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -57,8 +60,10 @@
 #include "core/hle/service/am/process_creation.h"
 #include "core/hle/service/apm/apm_controller.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_read_trace.h"
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/glue/time/static.h"
+#include "core/hle/service/glue/time/time_zone_binary.h"
 #include "core/hle/service/psc/time/static.h"
 #include "core/hle/service/psc/time/steady_clock.h"
 #include "core/hle/service/psc/time/system_clock.h"
@@ -90,6 +95,15 @@ namespace Core {
 std::atomic<u64> g_nx2_present_count{};
 static_assert(std::atomic<u64>::is_always_lock_free);
 std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+
+void RecordGuestPresent() {
+    const u64 present = g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    g_nx2_present_times_ns[present % g_nx2_present_times_ns.size()].store(
+        present_ns, std::memory_order_relaxed);
+}
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
@@ -198,15 +212,25 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
         return Switch2ProgramId(metadata, npdm);
     }
+    if (type == Loader::FileType::NCA) {
+        const FileSys::NCA nca{file};
+        const auto exefs = nca.GetStatus() == Loader::ResultStatus::Success ? nca.GetExeFS() : nullptr;
+        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
+        return Switch2ProgramId(metadata, npdm);
+    }
     const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
     const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
     return Switch2ProgramId(metadata, npdm);
 }
 
 struct System::Impl {
-    explicit Impl(System& system)
+    explicit Impl(System& system, Service::Account::ProfileStorage profile_storage)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
-          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+          reporter{system, profile_storage == Service::Account::ProfileStorage::Scratch
+                               ? Reporter::FSAccessLogPolicy::Disabled
+                               : Reporter::FSAccessLogPolicy::Disk},
+          applet_manager{system}, frontend_applets{system},
+          profile_manager{std::make_shared<Service::Account::ProfileManager>(profile_storage)} {}
 
     u64 program_id;
 
@@ -394,26 +418,56 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Not enough host memory to start the guest kernel");
             return SystemResultStatus::ErrorMemoryAllocation;
         }
+        Kernel::Nx2ThreadStats::ReadSwitch();
+        Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
     }
 
     SystemResultStatus InitializeForGpuReplay(System& system, Frontend::EmuWindow& emu_window,
-                                              u64 program_id) {
+                                              u64 replay_program_id) {
         if (const auto result = InitializeKernel(system); result != SystemResultStatus::Success) {
             return result;
         }
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core) {
+            // As Load does: the kernel is up, and destroying it without its shutdown crashes.
+            ShutdownMainProcess();
             return SystemResultStatus::ErrorVideoCore;
         }
         is_powered_on = true;
-        perf_stats.emplace(program_id);
+        perf_stats.emplace(replay_program_id);
         return SystemResultStatus::Success;
     }
 
-    SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
+    SystemResultStatus SetupForApplicationProcess(
+        System& system, Frontend::EmuWindow& emu_window,
+        std::shared_ptr<const Service::SystemDataView> isolated_system_data = {}) {
+        if (profile_manager->IsScratch() != (isolated_system_data != nullptr)) {
+            LOG_ERROR(Core, "Isolated system data and a scratch profile must be selected together");
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
+        std::shared_ptr<Service::Glue::Time::TimeZoneBinary> isolated_time_zone;
+        u64 isolated_process_id{};
+        if (isolated_system_data) {
+            constexpr u64 NativeHomeProgramId = 0x0400000000001000;
+            const auto* process = kernel.ApplicationProcess();
+            if (!process || !process->IsSwitch2() || process->IsApplication() ||
+                process->GetProgramId() != NativeHomeProgramId || process->GetProcessId() == 0) {
+                LOG_ERROR(Core, "Isolated system data requires the native HOME process");
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+            isolated_process_id = process->GetProcessId();
+            isolated_time_zone = std::make_shared<Service::Glue::Time::TimeZoneBinary>(system);
+            const auto result = isolated_time_zone->Mount(isolated_system_data);
+            if (result.IsFailure()) {
+                LOG_ERROR(Core, "Cannot mount isolated time-zone data: {:#x}", result.raw);
+                return SystemResultStatus::ErrorSystemFiles;
+            }
+        }
+
         host1x_core.emplace(system);
         VideoCore::CreateGPU(gpu_core, emu_window, system);
         if (!gpu_core)
@@ -422,7 +476,9 @@ struct System::Impl {
         audio_core.emplace(system);
 
         service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
-        services.emplace(service_manager, system, stop_event.get_token());
+        services.emplace(service_manager, system, stop_event.get_token(),
+                         std::move(isolated_system_data), std::move(isolated_time_zone),
+                         isolated_process_id);
 
         is_powered_on = true;
         exit_locked = false;
@@ -438,6 +494,10 @@ struct System::Impl {
     }
 
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
+        if (profile_manager->IsScratch()) {
+            return SystemResultStatus::ErrorSystemFiles;
+        }
+
         VideoCommon::StutterTrace::BootMarker("boot_start");
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
@@ -512,6 +572,9 @@ struct System::Impl {
         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+            // Its destructor finalizes the KProcess through the kernel: free it before the kernel
+            // shuts down, as a normal stop does.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
@@ -520,9 +583,26 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
             // The kernel is already initialized. Left running, it is destroyed with the global
             // System after main() returns, when device memory is already gone, and exit crashes.
+            process.reset();
             ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
         }
+
+        kernel.SetApplicationProcess(process->GetHandle());
+#ifdef HAS_HYPERVISOR
+        const bool has_hypervisor = static_cast<bool>(process->GetHandle()->GetMemory().GetHypervisor());
+        if (has_hypervisor && !cpu_manager.Initialize(process->GetHandle())) {
+            LOG_WARNING(Core, "Hypervisor vCPU setup failed; reloading the guest with Dynarmic");
+            process.reset();
+            ShutdownMainProcess();
+            SetShuttingDown(false);
+            allow_hypervisor_for_load = false;
+            SCOPE_EXIT {
+                allow_hypervisor_for_load = true;
+            };
+            return Load(system, emu_window, filepath, params);
+        }
+#endif
 
         if (app_loader->ReadProgramId(params.program_id) != Loader::ResultStatus::Success) {
             LOG_ERROR(Core, "Failed to find program id for ROM!");
@@ -541,18 +621,19 @@ struct System::Impl {
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
 
-        // Make the process created be the application
-        kernel.SetApplicationProcess(process->GetHandle());
-
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            process.reset();
             ShutdownMainProcess();
             return init_result;
         }
         // Waiting for GPU before initializing CPU
-        cpu_manager.Initialize();
+#ifdef HAS_HYPERVISOR
+        if (!has_hypervisor)
+#endif
+            cpu_manager.Initialize();
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -608,6 +689,12 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // The cheat VM runs on the timer thread, which keeps running through the teardown, and
+        // reads keys through the service manager and memory through the process. Freed below,
+        // they crashed it (a null ServiceManager at a stop, #1950). Its destructor waits for a
+        // run in progress.
+        cheat_engine.reset();
+
         // Once powered off, services stop writing replies, so a guest thread whose IPC call
         // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
         // every stop). Keep guest threads from running again first; the wait for running ones
@@ -637,7 +724,6 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         Common::NoteShutdownProgress();
@@ -649,6 +735,14 @@ struct System::Impl {
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
+        {
+            // The general channel's event is a kernel object made on first use. Left for ~Impl,
+            // it closed at exit() on a kernel already shut down (SIGSEGV in KAutoObject::Close).
+            // Its queued data stays for the next kernel, which remakes the event.
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+        }
         kernel.Shutdown();
         stop_event = {};
         Network::RestartSocketOperations();
@@ -706,11 +800,12 @@ struct System::Impl {
     Service::APM::Controller apm_controller{core_timing};
     /// Service State
     Service::Glue::ARPManager arp_manager;
-    Service::Account::ProfileManager profile_manager;
+    std::shared_ptr<Service::Account::ProfileManager> profile_manager;
     /// Network instance
     Network::NetworkInstance network_instance;
     Core::SpeedLimiter speed_limiter;
     ExecuteProgramCallback execute_program_callback;
+    LaunchInNewSessionCallback launch_in_new_session_callback;
     ExitCallback exit_callback;
     ApplicationChangedCallback application_changed_callback;
 
@@ -722,6 +817,9 @@ struct System::Impl {
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
     bool guest_memory_released{};
+#ifdef HAS_HYPERVISOR
+    bool allow_hypervisor_for_load{true};
+#endif
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
@@ -762,11 +860,17 @@ struct System::Impl {
         if (!general_channel_event) {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
+            if (!general_channel.empty()) {
+                general_channel_event->Signal(kernel);
+            }
         }
     }
 };
 
-System::System() : impl{std::make_unique<Impl>(*this)} {}
+System::System() : System{Service::Account::ProfileStorage::Shared} {}
+
+System::System(Service::Account::ProfileStorage profile_storage)
+    : impl{std::make_unique<Impl>(*this, profile_storage)} {}
 
 System::~System() = default;
 
@@ -845,6 +949,12 @@ SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::stri
 bool System::IsPoweredOn() const {
     return impl->is_powered_on.load(std::memory_order::relaxed);
 }
+
+#ifdef HAS_HYPERVISOR
+bool System::IsHypervisorAllowedForLoad() const {
+    return impl->allow_hypervisor_for_load;
+}
+#endif
 
 void System::PrepareReschedule(const u32 core_index) {
     impl->kernel.PrepareReschedule(core_index);
@@ -1101,11 +1211,15 @@ const Service::APM::Controller& System::GetAPMController() const {
 }
 
 Service::Account::ProfileManager& System::GetProfileManager() {
-    return impl->profile_manager;
+    return *impl->profile_manager;
 }
 
 const Service::Account::ProfileManager& System::GetProfileManager() const {
-    return impl->profile_manager;
+    return *impl->profile_manager;
+}
+
+std::shared_ptr<Service::Account::ProfileManager> System::GetScratchProfileManager() const {
+    return impl->profile_manager->IsScratch() ? impl->profile_manager : nullptr;
 }
 
 void System::SetExitLocked(bool locked) {
@@ -1184,6 +1298,18 @@ void System::ExecuteProgram(std::size_t program_index) {
     }
 }
 
+void System::RegisterLaunchInNewSessionCallback(LaunchInNewSessionCallback&& callback) {
+    impl->launch_in_new_session_callback = std::move(callback);
+}
+
+bool System::LaunchInNewSession(u64 program_id) {
+    if (!impl->launch_in_new_session_callback) {
+        return false;
+    }
+    impl->launch_in_new_session_callback(program_id);
+    return true;
+}
+
 const std::string& System::GetCurrentApplicationFilePath() const {
     return impl->current_application_filepath;
 }
@@ -1210,9 +1336,10 @@ void System::PushGeneralChannelData(std::vector<u8>&& data) {
 
 bool System::TryPopGeneralChannel(std::vector<u8>& out_data) {
     std::scoped_lock lk{impl->general_channel_mutex};
-    if (!impl->general_channel_event || impl->general_channel.empty()) {
+    if (impl->general_channel.empty()) {
         return false;
     }
+    impl->EnsureGeneralChannelInitialized(*this);
     out_data = std::move(impl->general_channel.back());
     impl->general_channel.pop_back();
     if (impl->general_channel.empty()) {
@@ -1246,6 +1373,9 @@ void System::RegisterApplicationChangedCallback(ApplicationChangedCallback&& cal
 void System::NotifyApplicationChanged(u64 program_id) {
     //LOG_DEBUG(Core, "Running application changed to {:016X}", program_id);
 
+    if (impl->gpu_core) {
+        impl->gpu_core->NotifyApplicationChanged(program_id);
+    }
     if (impl->application_changed_callback) {
         impl->application_changed_callback(program_id);
     }

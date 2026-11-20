@@ -12,9 +12,14 @@
 AboutDialog::AboutDialog(QWidget* parent)
     : QDialog(parent), ui{std::make_unique<Ui::AboutDialog>()} {
     static const std::string build_id = std::string{Common::g_build_id};
+    // Published builds show only their tag (build-N), so add the commit a report came from.
+    static const std::string version =
+        Common::g_is_dev_build
+            ? std::string{Common::g_build_version}
+            : fmt::format("{} ({:.10})", Common::g_build_version, Common::g_scm_rev);
     static const std::string lichii_build =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+        fmt::format("{} | {} | {}", std::string{Common::g_build_name}, version,
+                    std::string{Common::g_compiler_id});
 
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

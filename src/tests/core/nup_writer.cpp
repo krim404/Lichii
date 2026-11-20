@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <openssl/evp.h>
 
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
@@ -214,6 +215,54 @@ TEST_CASE("NUP add-ons are readable through the manual content provider", "[nup]
                                                  "game.nup"),
         true, TitleId + 0x20000));
     CHECK(provider.ListEntriesFilter({}, {}, {}).empty());
+}
+
+TEST_CASE("NUP loader registers a Switch 2 Edition's add-ons kept under the Switch 1 ID",
+          "[nup][nup-content]") {
+    // As Kirby and the Forgotten Land - Nintendo Switch 2 Edition: program 04004D300C5AE001,
+    // add-on 01004D300C5AF001.
+    constexpr u64 ProgramId = TitleId + 1;
+    constexpr u64 Switch1Application = 0x0100ABCD00010000ULL;
+    constexpr u64 AddOnId = Switch1Application + 0x1001;
+    TempDir tmp;
+    const auto root = tmp.path / "dump";
+    Put(root / "base/exefs/main", "main");
+    Put(root / "base/exefs/main.npdm", Npdm(ProgramId));
+    Put(root / "base/romfs/base.bin", "base");
+    Put(root / "dlc/0100ABCD00011001/0/romfs/addon.bin", "switch 1 addon");
+    Put(root / "dlc/0100ABCD00021001/0/romfs/foreign.bin", "foreign addon");
+    const auto archive = tmp.path / "game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    FileSys::RealVfsFilesystem vfs;
+    Loader::AppLoader_NUP loader{vfs.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    u64 program_id{};
+    REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::Success);
+    REQUIRE(program_id == ProgramId);
+    FileSys::ManualContentProvider provider;
+    loader.RegisterContent(provider);
+
+    const auto entries =
+        provider.ListEntriesFilter(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, {});
+    REQUIRE(entries.size() == 1);
+    CHECK(entries[0].title_id == AddOnId);
+    const auto nca = provider.GetEntry(AddOnId, FileSys::ContentRecordType::Data);
+    REQUIRE(nca != nullptr);
+    REQUIRE(nca->GetStatus() == Loader::ResultStatus::Success);
+    const auto romfs = FileSys::ExtractRomFS(nca->GetRomFS());
+    REQUIRE(romfs != nullptr);
+    CHECK(Read(romfs->GetFile("addon.bin")) == "switch 1 addon");
+
+    // As aoc lists them and hands out the add-on base the program mounts them by.
+    std::vector<u64> add_ons{AddOnId};
+    CHECK(FileSys::GetAddOnApplicationID(ProgramId, add_ons) == Switch1Application);
+    CHECK(FileSys::GetAOCBaseTitleID(FileSys::GetAddOnApplicationID(ProgramId, add_ons)) +
+              FileSys::GetAOCID(AddOnId) ==
+          AddOnId);
+    CHECK(FileSys::GetAddOnApplicationID(Switch1Application, add_ons) == Switch1Application);
+    add_ons.push_back(TitleId + 0x1002);
+    CHECK(FileSys::GetAddOnApplicationID(ProgramId, add_ons) == TitleId);
+    CHECK(FileSys::GetAddOnApplicationID(ProgramId, {}) == TitleId);
 }
 
 void MakeDump(const fs::path& root) {

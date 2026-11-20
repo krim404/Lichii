@@ -286,9 +286,9 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
     }
 }
 
-void IOFile::Close() {
+bool IOFile::Close() {
     if (!IsOpen()) {
-        return;
+        return true;
     }
 
     errno = 0;
@@ -302,6 +302,7 @@ void IOFile::Close() {
     }
 
     file = nullptr;
+    return close_result;
 }
 
 bool IOFile::IsOpen() const {

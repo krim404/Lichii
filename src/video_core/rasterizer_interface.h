@@ -160,6 +160,40 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, GPU-written command list words the host GPU takes over (Nx2ListIndirect): the
+    /// back's slots for them. Whether this rasterizer has them.
+    [[nodiscard]] virtual bool Nx2ListSlotsSupported() const {
+        return false;
+    }
+    /// Any thread: a slot nobody holds, held for the caller; none while every slot is held.
+    [[nodiscard]] virtual std::optional<u32> Nx2AcquireListSlot() {
+        return std::nullopt;
+    }
+    /// Any thread: drops a hold of `slot` (Nx2AcquireListSlot's or one the back took).
+    virtual void Nx2ReleaseListSlot([[maybe_unused]] u32 slot) {}
+    /// The back, at a list's place: the host GPU copies the list's `count` words at
+    /// `device_addr` into `slot`.
+    virtual void Nx2SnapshotListWords([[maybe_unused]] DAddr device_addr,
+                                      [[maybe_unused]] u32 count, [[maybe_unused]] u32 slot) {}
+    /// The back: the word at `device_addr` was just written `value`, the placeholder of a slot
+    /// word.
+    /// While it holds it, compute dispatches that bind the word as constant buffer data get the
+    /// slot word there instead.
+    virtual void Nx2NoteOwedListWord([[maybe_unused]] DAddr device_addr,
+                                     [[maybe_unused]] u32 value) {}
+    /// The back: an inline QMD with grid words `x`, `y`, `z` was just written at `device_addr`.
+    /// Holds the slots placeholders among them name, until the next inline QMD written there.
+    virtual void Nx2NoteInlineQmdGrid([[maybe_unused]] DAddr device_addr, [[maybe_unused]] u32 x,
+                                      [[maybe_unused]] u32 y, [[maybe_unused]] u32 z) {}
+    /// The back: the words of `slots`, three each, read back from the host GPU (waits for it).
+    virtual void Nx2ReadListSlots([[maybe_unused]] std::span<const u32> slots,
+                                  [[maybe_unused]] std::span<u32> words) {}
+    /// EDEN_NX2_LIST_INDIRECT_CHECK, the back, right after Nx2SnapshotListWords: the
+    /// words the front read as before for that list, for what the host GPU uses of the slot to
+    /// be compared with.
+    virtual void Nx2CheckListSlot([[maybe_unused]] u32 slot,
+                                  [[maybe_unused]] std::span<const u32> words) {}
+
     virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
         for (const DAddr page : pages) {
             FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
@@ -186,6 +220,14 @@ public:
         return true;
     }
 
+    /// Any thread: whether the texture or query cache may hold GPU data for the range that guest
+    /// memory lacks (an image was registered there, or a report can still land). Without caches
+    /// that can tell, assume so.
+    [[nodiscard]] virtual bool MayHoldImagesOrReports([[maybe_unused]] DAddr addr,
+                                                      [[maybe_unused]] u64 size) {
+        return true;
+    }
+
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
@@ -196,7 +238,7 @@ public:
 
     virtual void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
         // The skip keeps the texture cache: software engine writes reach images only here.
-        const auto which = Settings::values.skip_cpu_inner_invalidation.GetValue()
+        const auto which = Settings::SkipCpuInnerInvalidation()
                                ? VideoCommon::CacheType::TextureCache
                                : VideoCommon::CacheType::All;
         for (const auto& [cpu_addr, size] : sequences) {
@@ -299,8 +341,11 @@ public:
 
     /// Records a health check of a game's DLSS network output (dst) against its input (src) and
     /// returns the result of an earlier check once the GPU has finished it.
+    /// `src_region` is the part of src the game rendered, from its top-left corner (a dynamic
+    /// resolution network's render region); without it, the whole of src.
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt) {
         return std::nullopt;
     }
 

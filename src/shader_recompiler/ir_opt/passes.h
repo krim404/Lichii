@@ -18,7 +18,7 @@ struct HostTranslateInfo;
 namespace Shader::Optimization {
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program);
-void ConditionalBarrierPass(IR::Program& program);
+void ConditionalBarrierPass(IR::Program& program, u32 max_shared_memory_size);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);

@@ -136,6 +136,8 @@ public:
     static constexpr int FullPathRole = SortRole + 2;
     static constexpr int ProgramIdRole = SortRole + 3;
     static constexpr int FileTypeRole = SortRole + 4;
+    /// True when the picture comes from the game or its custom artwork, not the default art.
+    static constexpr int HasIconRole = SortRole + 5;
 
     GameListItemPath() = default;
     GameListItemPath(const QString& game_path, const std::vector<u8>& picture_data,
@@ -168,15 +170,23 @@ public:
 
         setData(tooltip, Qt::ToolTipRole);
 
+        SetPicture(this, picture_data);
+    }
+
+    /// Shows an image file as a game's picture, or the default art when it is not an image.
+    static void SetPicture(QStandardItem* item, const std::vector<u8>& picture_data) {
         const u32 size = UISettings::CurrentGameIconSize().GetValue();
 
         QPixmap picture;
-        if (!picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
+        const bool has_icon =
+            picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()));
+        if (!has_icon) {
             picture = GetDefaultIcon(size);
         }
         picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
 
-        setData(RoundedIcon(picture), Qt::DecorationRole);
+        item->setData(RoundedIcon(picture), Qt::DecorationRole);
+        item->setData(has_icon, HasIconRole);
     }
 
     int type() const override {

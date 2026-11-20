@@ -21,6 +21,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "frontend_common/play_time_manager.h"
 #include "qt_common/config/uisettings.h"
+#include "qt_common/game_list/patch_cache.h"
 
 namespace Core {
 class System;
@@ -91,6 +92,9 @@ private:
     const PlayTime::PlayTimeManager& play_time_manager;
 
     QStringList watch_list;
+    GameListPatchCache patch_cache;
+    /// Loose dumps found by this scan, sized after the list is shown.
+    std::vector<std::string> loose_dumps;
 
     std::mutex lock;
     std::condition_variable cv;

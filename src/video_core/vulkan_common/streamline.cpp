@@ -45,6 +45,10 @@ constexpr const wchar_t* MODEL = L"nvngx_dlss.dll";
 // The first DLSS with preset K.
 constexpr u32 MIN_DLSS_MAJOR = 310;
 
+// What DLSS super resolution loads from the loader's folder besides the loader and the model:
+// sl.dlss.dll needs sl.common.dll.
+constexpr std::array<const char*, 2> DLSS_PLUGIN_FILES{"sl.common.dll", "sl.dlss.dll"};
+
 // Everything frame generation loads from the loader's folder. The SR plugins are here too: a local
 // sl.dlss_g.dll has to come with the sl.common.dll of its own release. Reflex on Vulkan goes
 // through NvLowLatencyVk.dll.
@@ -502,24 +506,35 @@ DlssFiles FindDlssFiles() {
     files.model_version = VersionText(files.model);
     files.app_model_version = VersionText(files.app_model);
     // A Streamline module loads only with the sl.common.dll and loader of its own release.
-    std::string streamline_version = files.interposer_version;
-    for (const char* const name : FRAME_GEN_FILES) {
-        const std::filesystem::path path = files.folder / name;
-        if (!std::filesystem::is_regular_file(path, ec)) {
-            files.frame_gen_missing.emplace_back(name);
-            continue;
+    const auto check = [&files, &ec](std::span<const char* const> names,
+                                     std::vector<std::string>& missing) {
+        std::string streamline_version = files.interposer_version;
+        bool mixed = false;
+        for (const char* const name : names) {
+            const std::filesystem::path path = files.folder / name;
+            if (!std::filesystem::is_regular_file(path, ec)) {
+                missing.emplace_back(name);
+                continue;
+            }
+            if (!std::string_view{name}.starts_with("sl.")) {
+                continue;
+            }
+            const std::string version = VersionText(path);
+            if (streamline_version.empty()) {
+                streamline_version = version;
+            } else if (!version.empty() && version != streamline_version) {
+                mixed = true;
+            }
         }
-        if (!std::string_view{name}.starts_with("sl.")) {
-            continue;
-        }
-        const std::string version = VersionText(path);
-        if (streamline_version.empty()) {
-            streamline_version = version;
-        } else if (!version.empty() && version != streamline_version) {
-            files.streamline_mixed = true;
-        }
-    }
+        return mixed;
+    };
+    files.dlss_mixed = check(DLSS_PLUGIN_FILES, files.dlss_missing);
+    files.streamline_mixed = check(FRAME_GEN_FILES, files.frame_gen_missing);
     return files;
+}
+
+std::span<const char* const> DlssPluginFiles() {
+    return DLSS_PLUGIN_FILES;
 }
 
 std::span<const char* const> FrameGenFiles() {
@@ -614,8 +629,9 @@ bool Start(void* window) {
     if (const sl::Result result = api.get_feature_requirements(sl::kFeatureDLSS, requirements);
         result != sl::Result::eOk) {
         LOG_WARNING(Render_Vulkan,
-                    "Streamline found no DLSS plugin (result {}); put sl.dlss.dll next to "
-                    "sl.interposer.dll or install the NVIDIA app. Using FSR 3.1",
+                    "Streamline found no DLSS plugin (result {}); put sl.common.dll and "
+                    "sl.dlss.dll next to sl.interposer.dll (the Graphics settings can download "
+                    "them) or install the NVIDIA app. Using FSR 3.1",
                     static_cast<int>(result));
         api.shutdown();
         return false;

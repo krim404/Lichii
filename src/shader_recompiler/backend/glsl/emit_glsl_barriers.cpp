@@ -19,4 +19,19 @@ void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
 void EmitDeviceMemoryBarrier(EmitContext& ctx) {
     ctx.Add("memoryBarrier();");
 }
+
+void EmitBarrierVoteInit(EmitContext& ctx, u32 offset) {
+    ctx.Add("atomicExchange(smem[{}],0u);barrier();", offset / 4);
+}
+
+void EmitBarrierVote(EmitContext& ctx, std::string_view cond, u32 offset, u32 size) {
+    ctx.Add("if(atomicAdd(smem[{}],0u)%{}u==0u){{barrier();atomicAdd(smem[{}],{}?1u:0u);"
+            "barrier();}}",
+            offset / 4, size, offset / 4, cond);
+}
+
+void EmitVotedBarrier(EmitContext& ctx, u32 offset, u32 size) {
+    ctx.Add("if(atomicAdd(smem[{}],0u)%{}u==0u){{barrier();}}else{{groupMemoryBarrier();}}",
+            offset / 4, size);
+}
 } // namespace Shader::Backend::GLSL

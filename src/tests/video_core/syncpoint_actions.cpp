@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -158,4 +159,98 @@ TEST_CASE("Guest increments wait for a stable copy of the guest values",
     increment.join();
     REQUIRE(value_while_stable == 0);
     REQUIRE(manager.GetGuestSyncpointValue(0) == 1);
+}
+
+TEST_CASE("Syncpoint actions run outside the guard, in value order",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::vector<u32> order;
+    bool nested = false;
+    // An action that registers another one takes the guard itself; under the guard this
+    // deadlocked.
+    manager.RegisterGuestAction(0, 2, [&] {
+        order.push_back(2);
+        manager.RegisterGuestAction(1, 1, [&nested] { nested = true; });
+    });
+    manager.RegisterGuestAction(0, 1, [&order] { order.push_back(1); });
+    manager.RegisterGuestAction(0, 3, [&order] { order.push_back(3); });
+    manager.IncrementGuest(0);
+    manager.IncrementGuest(0);
+    REQUIRE(order == std::vector<u32>{1, 2});
+    manager.IncrementGuest(1);
+    REQUIRE(nested);
+    manager.IncrementGuest(0);
+    REQUIRE(order == std::vector<u32>{1, 2, 3});
+}
+
+TEST_CASE("A syncpoint action can cancel itself and a later due action",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    bool second = false;
+    SyncpointManager::ActionHandle first{};
+    // Actions for the same value run newest first.
+    const auto later = manager.RegisterGuestAction(0, 1, [&second] { second = true; });
+    first = manager.RegisterGuestAction(0, 1, [&] {
+        manager.DeregisterGuestAction(0, first); // must not wait for itself
+        manager.DeregisterGuestAction(0, later);
+    });
+    manager.IncrementGuest(0);
+    REQUIRE_FALSE(second);
+}
+
+TEST_CASE("A blocked syncpoint action holds up neither other syncpoints nor unrelated cancels",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    bool second = false;
+    bool other = false;
+    const auto handle = manager.RegisterGuestAction(0, 1, [&second] { second = true; });
+    manager.RegisterGuestAction(0, 1, [&] {
+        entered = true;
+        while (!release) {
+            std::this_thread::yield();
+        }
+    });
+    std::thread incrementer{[&] { manager.IncrementGuest(0); }};
+    while (!entered) {
+        std::this_thread::yield();
+    }
+    // The composite action blocks like this in AcquireNextImage.
+    manager.RegisterGuestAction(1, 1, [&other] { other = true; });
+    manager.IncrementGuest(1);
+    manager.IncrementHost(0);
+    REQUIRE(other);
+    // Due behind the blocked action but not started: the cancel drops it without waiting.
+    manager.DeregisterGuestAction(0, handle);
+    release = true;
+    incrementer.join();
+    REQUIRE_FALSE(second);
+}
+
+TEST_CASE("Cancelling a running syncpoint action returns once it is done",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> done{false};
+    const auto handle = manager.RegisterGuestAction(0, 1, [&] {
+        entered = true;
+        while (!release) {
+            std::this_thread::yield();
+        }
+        done = true;
+    });
+    std::thread incrementer{[&] { manager.IncrementGuest(0); }};
+    while (!entered) {
+        std::this_thread::yield();
+    }
+    std::thread releaser{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        release = true;
+    }};
+    manager.DeregisterGuestAction(0, handle);
+    REQUIRE(done);
+    releaser.join();
+    incrementer.join();
 }

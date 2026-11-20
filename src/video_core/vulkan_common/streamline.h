@@ -27,12 +27,20 @@ struct DlssFiles {
     std::string interposer_version;
     std::string model_version;
     std::string app_model_version;
+    /// File names of the Streamline plugins DLSS needs (DlssPluginFiles) that are not in the
+    /// loader's folder.
+    std::vector<std::string> dlss_missing;
+    /// The loader and DLSS's Streamline plugins in its folder are not all from one release.
+    bool dlss_mixed{};
     /// File names of the Streamline plugins and NVIDIA files DLSS Frame Generation needs that
     /// are not in the loader's folder.
     std::vector<std::string> frame_gen_missing;
     /// The Streamline modules in the loader's folder (sl.*) are not all from one release.
     bool streamline_mixed{};
 };
+
+/// The Streamline plugins DLSS super resolution loads from the loader's folder.
+[[nodiscard]] std::span<const char* const> DlssPluginFiles();
 
 /// Everything DLSS Frame Generation loads from the loader's folder besides the loader itself.
 [[nodiscard]] std::span<const char* const> FrameGenFiles();

@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: 2017 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include <QMenu>
 #include <QMessageBox>
 #include <QStandardItemModel>
@@ -22,6 +24,15 @@
 constexpr int name_column = 0;
 constexpr int hotkey_column = 1;
 constexpr int controller_column = 2;
+
+static const UISettings::Shortcut* DefaultHotkey(const QStandardItem& action) {
+    const std::string name = action.data().toString().toStdString();
+    const std::string group = action.parent()->data().toString().toStdString();
+    const auto it = std::ranges::find_if(UISettings::default_hotkeys, [&](const auto& hotkey) {
+        return hotkey.name == name && hotkey.group == group;
+    });
+    return it == UISettings::default_hotkeys.end() ? nullptr : &*it;
+}
 
 static QString HotkeyDisplayName(const QString& action) {
     // Keep the stored shortcut key compatible with existing configurations.
@@ -342,23 +353,16 @@ void ConfigureHotkeys::ApplyConfiguration(HotkeyRegistry& registry) {
 
 void ConfigureHotkeys::RestoreDefaults() {
     for (int r = 0; r < model->rowCount(); ++r) {
-        const QStandardItem* parent = model->item(r, 0);
-        const int hotkey_size = static_cast<int>(UISettings::default_hotkeys.size());
-
-        if (hotkey_size != parent->rowCount()) {
-            QMessageBox::warning(this, tr("Invalid hotkey settings"),
-                                 tr("An error occurred. Please report this issue on github."));
-            return;
-        }
-
+        QStandardItem* parent = model->item(r, 0);
         for (int r2 = 0; r2 < parent->rowCount(); ++r2) {
-            model->item(r, 0)
-                ->child(r2, hotkey_column)
-                ->setText(QString::fromStdString(UISettings::default_hotkeys[r2].shortcut.keyseq));
-            model->item(r, 0)
-                ->child(r2, controller_column)
-                ->setText(QString::fromStdString(
-                    UISettings::default_hotkeys[r2].shortcut.controller_keyseq));
+            const UISettings::Shortcut* hotkey = DefaultHotkey(*parent->child(r2, name_column));
+            if (hotkey == nullptr) {
+                continue;
+            }
+            parent->child(r2, hotkey_column)
+                ->setText(QString::fromStdString(hotkey->shortcut.keyseq));
+            parent->child(r2, controller_column)
+                ->setText(QString::fromStdString(hotkey->shortcut.controller_keyseq));
         }
     }
 }
@@ -403,8 +407,12 @@ void ConfigureHotkeys::PopupContextMenu(const QPoint& menu_location) {
 }
 
 void ConfigureHotkeys::RestoreControllerHotkey(QModelIndex index) {
-    const QString& default_key_sequence =
-        QString::fromStdString(UISettings::default_hotkeys[index.row()].shortcut.controller_keyseq);
+    const UISettings::Shortcut* hotkey =
+        DefaultHotkey(*model->itemFromIndex(index.siblingAtColumn(name_column)));
+    if (hotkey == nullptr) {
+        return;
+    }
+    const QString default_key_sequence = QString::fromStdString(hotkey->shortcut.controller_keyseq);
     const auto [key_sequence_used, used_action] = IsUsedControllerKey(default_key_sequence);
 
     if (key_sequence_used && default_key_sequence != model->data(index).toString()) {
@@ -417,9 +425,13 @@ void ConfigureHotkeys::RestoreControllerHotkey(QModelIndex index) {
 }
 
 void ConfigureHotkeys::RestoreHotkey(QModelIndex index) {
-    const QKeySequence& default_key_sequence = QKeySequence::fromString(
-        QString::fromStdString(UISettings::default_hotkeys[index.row()].shortcut.keyseq),
-        QKeySequence::NativeText);
+    const UISettings::Shortcut* hotkey =
+        DefaultHotkey(*model->itemFromIndex(index.siblingAtColumn(name_column)));
+    if (hotkey == nullptr) {
+        return;
+    }
+    const QKeySequence default_key_sequence = QKeySequence::fromString(
+        QString::fromStdString(hotkey->shortcut.keyseq), QKeySequence::NativeText);
     const auto [key_sequence_used, used_action] = IsUsedKey(default_key_sequence);
 
     if (key_sequence_used && default_key_sequence != QKeySequence(model->data(index).toString())) {

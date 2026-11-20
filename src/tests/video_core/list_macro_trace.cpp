@@ -113,10 +113,14 @@ TEST_CASE("ListMacroTrace: what reads the data RAM words a GPU-written entry's c
     Tegra::TuringMacroInterpreter interpreter;
     std::array<u32, 0x1000> registers{};
     int engine{};
+    // The trace remembers what it learnt of a macro's code by the code's address and generation,
+    // and the test case above leaves an entry for its freed code under generation 1: when the heap
+    // hands that address to `reader`, a call with the same generation would be judged as that code.
+    constexpr u64 generation = 2;
     const auto run = [&](const std::vector<u32>& code, u32 method, std::vector<u32> parameters) {
         Trace::Call* const call =
-            Trace::BeginCall(Trace::Engine::Compute, &engine, method, code, 1, 0, parameters,
-                             interpreter.dram, registers);
+            Trace::BeginCall(Trace::Engine::Compute, &engine, method, code, generation, 0,
+                             parameters, interpreter.dram, registers);
         if (call == nullptr) {
             return false;
         }

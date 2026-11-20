@@ -281,7 +281,7 @@ TEST_CASE("Shader cache v2 driver blobs: a file cut off anywhere loses only the 
             REQUIRE(store.Discarded() == V2::DriverBlobDiscard::None);
             // Only padding missing still leaves the record whole
             const u64 framed = V2::RecordHeaderSize + TestPayload(5).size() + V2::RecordHashSize;
-            REQUIRE(store.Counts().loaded == (size - begin >= framed ? 6 : 5));
+            REQUIRE(store.Counts().loaded == (size - begin >= framed ? 6U : 5U));
             for (u64 i = 0; i < 5; ++i) {
                 REQUIRE(store.Find(TestKind(i), 0x100 + i) == TestPayload(i));
             }

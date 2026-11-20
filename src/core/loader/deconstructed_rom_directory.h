@@ -32,6 +32,9 @@ public:
                                                  bool override_update_ = false,
                                                  bool apply_installed_update_ = true);
 
+    static std::pair<ResultStatus, std::unique_ptr<AppLoader_DeconstructedRomDirectory>>
+    CreateNativeHomeExecutable(const FileSys::VirtualDir& immutable_verified_exefs);
+
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
      *
@@ -43,6 +46,9 @@ public:
     static FileType IdentifyType(const FileSys::VirtualFile& dir_file);
 
     FileType GetFileType() const override {
+        if (exact_modules) {
+            return FileType::DeconstructedRomDirectory;
+        }
         return IdentifyType(file);
     }
 
@@ -57,8 +63,12 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadMainBuildId(Core::System& system, std::array<u8, 0x20>& build_id) override;
 
 private:
+    using ExeFSModules = std::array<FileSys::VirtualFile, 13>;
+    AppLoader_DeconstructedRomDirectory(ExeFSModules modules, FileSys::ProgramMetadata program);
+
     /// The loose RomFS next to the ExeFS, found (and built) on first use.
     const FileSys::VirtualFile& LooseRomFS();
 
@@ -75,6 +85,7 @@ private:
     u64 title_id{};
     bool override_update;
     bool apply_installed_update{true};
+    std::optional<ExeFSModules> exact_modules;
 
     Modules modules;
 };

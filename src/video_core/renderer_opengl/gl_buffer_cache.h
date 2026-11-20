@@ -198,6 +198,11 @@ public:
         return device.CanReportMemoryUsage();
     }
 
+    /// Bytes each cached buffer allocates past its size.
+    u64 GetBufferAllocationTail() const {
+        return 0;
+    }
+
     u32 GetUniformBufferAlignment() const {
         return static_cast<u32>(device.GetUniformBufferAlignment());
     }

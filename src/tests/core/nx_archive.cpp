@@ -389,7 +389,7 @@ TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core]
             loader.RegisterContent(provider);
             const auto entries = provider.ListEntriesFilter(
                 FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, std::nullopt);
-            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2 : 1));
+            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2U : 1U));
             const auto dlc =
                 provider.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
             REQUIRE(dlc != nullptr);

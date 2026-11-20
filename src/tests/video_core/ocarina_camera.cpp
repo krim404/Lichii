@@ -77,3 +77,41 @@ TEST_CASE("Ocarina camera accepts DLSS padding only within the existing toleranc
     CHECK(DecodeOcarinaCamera(Camera(2276, 1280), 2292, 1280, true).issue ==
           OcarinaCameraIssue::Extent);
 }
+
+TEST_CASE("Ocarina jitter keeps the viewport's right and bottom edges where AMD truncates them",
+          "[video_core][ocarina]") {
+    // PAL's viewport scissor ends at static_cast<int32>(origin + size).
+    constexpr f32 width = 1920.0f;
+    constexpr f32 height = 1080.0f;
+    for (u32 index = 1; index <= 72; ++index) {
+        const auto [x, y] = VideoCommon::OcarinaJitter(index, true);
+        CHECK(x >= 0.0f);
+        CHECK(x < 1.0f);
+        CHECK(y >= 0.0f);
+        CHECK(y < 1.0f);
+        CHECK(static_cast<s32>(x) == 0);
+        CHECK(static_cast<s32>(y) == 0);
+        CHECK(static_cast<s32>(width + x) == 1920);
+        CHECK(static_cast<s32>(height + y) == 1080);
+        CHECK((x != 0.0f || y != 0.0f));
+    }
+}
+
+TEST_CASE("Ocarina jitter stays centred on the pixel elsewhere", "[video_core][ocarina]") {
+    bool negative_x = false;
+    bool negative_y = false;
+    for (u32 index = 1; index <= 72; ++index) {
+        const auto [x, y] = VideoCommon::OcarinaJitter(index, false);
+        CHECK(x >= -0.5f);
+        CHECK(x < 0.5f);
+        CHECK(y >= -0.5f);
+        CHECK(y < 0.5f);
+        negative_x |= x < 0.0f;
+        negative_y |= y < 0.0f;
+    }
+    CHECK(negative_x);
+    CHECK(negative_y);
+    const auto first = VideoCommon::OcarinaJitter(1, false);
+    CHECK(first[0] == 0.0f);
+    CHECK(first[1] == 1.0f / 3.0f - 0.5f);
+}

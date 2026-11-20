@@ -339,6 +339,15 @@ if (ARCHITECTURE_arm64 AND (ANDROID OR LINUX))
     add_compile_definitions(HAS_NCE=1)
 endif()
 
+if (ARCHITECTURE_arm64 AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(HAS_HYPERVISOR 1)
+    add_compile_definitions(HAS_HYPERVISOR=1)
+endif()
+
+if ((HAS_NCE AND NOT ANDROID) OR HAS_HYPERVISOR)
+    add_compile_definitions(HAS_NATIVE_PAGE_PROTECTION=1)
+endif()
+
 if (LICHII_ROOM)
     add_compile_definitions(LICHII_ROOM)
 endif()

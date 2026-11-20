@@ -38,9 +38,7 @@
 #include "video_core/vulkan_common/streamline.h"
 #include "lichii/configuration/nvidia_dlss_panel.h"
 
-#ifdef LICHII_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 namespace {
 
@@ -268,9 +266,7 @@ private:
         client->set_connection_timeout(30);
         client->set_read_timeout(30);
         client->set_write_timeout(30);
-#ifdef LICHII_BUNDLED_OPENSSL
-        client->load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(*client);
         return client;
     }
 
@@ -368,7 +364,19 @@ void NvidiaDlssPanel::showEvent(QShowEvent* event) {
 
 void NvidiaDlssPanel::Refresh() {
     const Streamline::DlssFiles files = Streamline::FindDlssFiles();
-    const bool has_loader = !files.interposer.empty();
+    QStringList streamline_missing;
+    if (files.interposer.empty()) {
+        streamline_missing << QStringLiteral("sl.interposer.dll");
+    }
+    for (const std::string& name : files.dlss_missing) {
+        streamline_missing << QString::fromStdString(name);
+    }
+    const bool has_streamline = streamline_missing.isEmpty() && !files.dlss_mixed;
+    const QString streamline =
+        !streamline_missing.isEmpty()
+            ? Tr("NVIDIA Streamline (%1)").arg(streamline_missing.join(QStringLiteral(", ")))
+            : Tr("NVIDIA Streamline's files (sl.*) from one release; these are from different "
+                 "ones");
     const bool has_model = !files.model.empty() || !files.app_model.empty();
     const QString dlss = !files.model.empty()
                              ? Named(QStringLiteral("DLSS"), files.model_version)
@@ -394,7 +402,7 @@ void NvidiaDlssPanel::Refresh() {
 
     QString status;
     QString button;
-    if (has_loader && has_model) {
+    if (has_streamline && has_model) {
         status =
             Tr("<b>Ready.</b> Found %1 and %2.<br>DLSS and the settings below apply only "
                "when a game uses its own DLSS. While DLSS runs, the status bar shows DLSS, "
@@ -402,23 +410,24 @@ void NvidiaDlssPanel::Refresh() {
                 .arg(Named(QStringLiteral("NVIDIA Streamline"), files.interposer_version), dlss);
         button = Tr("Download Frame Generation files from NVIDIA");
     } else if (has_model) {
-        status = Tr("<b>One file needed:</b> NVIDIA's Streamline loader (sl.interposer.dll). "
-                    "%1 will be used. Until then, games use AMD FSR 3.1.")
-                     .arg(dlss);
+        status = Tr("<b>Files needed:</b> %1. %2 will be used. Until then, games use AMD FSR "
+                    "3.1.")
+                     .arg(streamline, dlss);
         button = has_frame_gen ? Tr("Download from NVIDIA (1 MB)") : Tr("Download from NVIDIA");
-    } else if (has_loader) {
+    } else if (has_streamline) {
         status = Tr("<b>One file needed:</b> NVIDIA DLSS (nvngx_dlss.dll). Until then, games use "
                     "AMD FSR 3.1.");
         button = has_frame_gen ? Tr("Download from NVIDIA (31 MB)") : Tr("Download from NVIDIA");
     } else {
-        status = Tr("<b>NVIDIA's files needed:</b> the Streamline loader and DLSS "
-                    "(sl.interposer.dll and nvngx_dlss.dll). Until then, games use AMD FSR 3.1.");
+        status = Tr("<b>NVIDIA's files needed:</b> %1 and DLSS (nvngx_dlss.dll). Until then, "
+                    "games use AMD FSR 3.1.")
+                     .arg(streamline);
         button = has_frame_gen ? Tr("Download from NVIDIA (32 MB)") : Tr("Download from NVIDIA");
     }
     if (!frame_gen.isEmpty()) {
         status += QStringLiteral(" ") + frame_gen;
     }
-    const bool ready = has_loader && has_model;
+    const bool ready = has_streamline && has_model;
     icon_label->setText(ready ? QStringLiteral("<span style=\"color:#2ea043\">&#10004;</span>")
                               : QStringLiteral("<span style=\"color:#d29922\">&#9888;</span>"));
     status_label->setText(status);
@@ -438,24 +447,33 @@ void NvidiaDlssPanel::SetFrameGenWanted(bool wanted) {
 void NvidiaDlssPanel::Download() {
     const Streamline::DlssFiles files = Streamline::FindDlssFiles();
     std::vector<std::string> wanted;
-    // Frame generation's files come as one set with the loader, all from this release: Streamline
-    // loads a module only with the sl.common.dll and loader of its own release.
+    // DLSS's Streamline plugins and frame generation's files each come as one set with the loader,
+    // all from this release: Streamline loads a module only with the sl.common.dll and loader of
+    // its own release.
+    if (files.interposer.empty() || !files.dlss_missing.empty() || files.dlss_mixed) {
+        wanted.emplace_back(INTERPOSER_ENTRY);
+        for (const char* const name : Streamline::DlssPluginFiles()) {
+            wanted.push_back(BIN_DIR + std::string{name});
+        }
+    }
+    if (files.model.empty() && files.app_model.empty()) {
+        wanted.emplace_back(MODEL_ENTRY);
+    }
     std::vector<std::string> frame_gen_set;
     if (frame_gen_wanted && (!files.frame_gen_missing.empty() || files.streamline_mixed)) {
-        frame_gen_set.emplace_back(INTERPOSER_ENTRY);
+        const auto add = [&wanted, &frame_gen_set](std::string entry) {
+            if (std::ranges::find(wanted, entry) == wanted.end()) {
+                frame_gen_set.push_back(std::move(entry));
+            }
+        };
+        add(INTERPOSER_ENTRY);
         for (const char* const name : Streamline::FrameGenFiles()) {
-            frame_gen_set.push_back(BIN_DIR + std::string{name});
+            add(BIN_DIR + std::string{name});
         }
     }
     const auto in_frame_gen_set = [&frame_gen_set](const std::string& entry) {
         return std::ranges::find(frame_gen_set, entry) != frame_gen_set.end();
     };
-    if (files.interposer.empty() && !in_frame_gen_set(INTERPOSER_ENTRY)) {
-        wanted.emplace_back(INTERPOSER_ENTRY);
-    }
-    if (files.model.empty() && files.app_model.empty()) {
-        wanted.emplace_back(MODEL_ENTRY);
-    }
     wanted.insert(wanted.end(), frame_gen_set.begin(), frame_gen_set.end());
     if (wanted.empty()) {
         return;

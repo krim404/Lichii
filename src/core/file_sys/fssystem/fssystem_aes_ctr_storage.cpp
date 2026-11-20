@@ -51,7 +51,9 @@ size_t AesCtrStorage::Read(u8* buffer, size_t size, size_t offset) const {
     ASSERT(Common::IsAligned(size, BlockSize));
 
     // Read the data.
-    m_base_storage->Read(buffer, size, offset);
+    if (m_base_storage->Read(buffer, size, offset) != size) {
+        return 0;
+    }
 
     // Setup the counter.
     std::array<u8, IvSize> ctr;

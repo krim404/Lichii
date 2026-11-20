@@ -58,7 +58,9 @@ void GameGrid::UpdateIconSize() {
     const u32 icon_size = UISettings::values.game_cover_size.GetValue();
 
     int heightMargin = 0;
-    int widthMargin = 80;
+    // The card hugs the icon; the title wraps to the icon's width, so extra width is only
+    // needed for the "no icon" case. Leftover row space becomes the gap between cards.
+    int widthMargin = 24;
 
     if (UISettings::values.show_game_name) {
         switch (icon_size) {

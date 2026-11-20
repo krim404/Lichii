@@ -19,6 +19,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/loader/nca.h"
+#include "frontend_common/content_copy.h"
 
 namespace ContentManager {
 
@@ -58,15 +59,13 @@ inline size_t RemoveAllDLC(Core::System& system, const u64 program_id) {
     const auto& fs_controller = system.GetFileSystemController();
     const auto dlc_entries = system.GetContentProvider().ListEntriesFilter(
         FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
-    std::vector<u64> program_dlc_entries;
-
+    std::vector<u64> add_on_content;
+    add_on_content.reserve(dlc_entries.size());
     for (const auto& entry : dlc_entries) {
-        if (FileSys::GetBaseTitleID(entry.title_id) == program_id) {
-            program_dlc_entries.push_back(entry.title_id);
-        }
+        add_on_content.push_back(entry.title_id);
     }
 
-    for (const auto& entry : program_dlc_entries) {
+    for (const auto& entry : FileSys::GetAddOnContent(program_id, add_on_content)) {
         if (RemoveDLC(fs_controller, entry)) {
             ++count;
         }
@@ -139,25 +138,7 @@ inline InstallResult InstallNSP(Core::System& system, FileSys::VfsFilesystem& vf
                                 const std::function<bool(size_t, size_t)>& callback) {
     const auto copy = [callback](const FileSys::VirtualFile& src, const FileSys::VirtualFile& dest,
                                  std::size_t block_size) {
-        if (src == nullptr || dest == nullptr) {
-            return false;
-        }
-        if (!dest->Resize(src->GetSize())) {
-            return false;
-        }
-
-        using namespace Common::Literals;
-        std::vector<u8> buffer(1_MiB);
-
-        for (std::size_t i = 0; i < src->GetSize(); i += buffer.size()) {
-            if (callback(src->GetSize(), i)) {
-                dest->Resize(0);
-                return false;
-            }
-            const auto read = src->Read(buffer.data(), buffer.size(), i);
-            dest->Write(buffer.data(), read, i);
-        }
-        return true;
+        return FrontendCommon::CopyInstallFile(src, dest, block_size, callback);
     };
 
     std::shared_ptr<FileSys::NSP> nsp;

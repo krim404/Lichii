@@ -58,6 +58,9 @@ public:
 
     void ApplyConfiguration();
 
+    /// Drop the controller edits that were not applied; the Controls tab changes them live.
+    void RestoreInputConfiguration();
+
 private slots:
     void OnLanguageChanged(const QString& locale);
 
@@ -67,7 +70,12 @@ signals:
 
 private:
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
+
+    /// Widens the dialog until the open page and its tab row fit without a horizontal scrollbar,
+    /// up to the screen width. A page that still does not fit is switched to its compact style.
+    void FitPageWidth();
 
     void HandleApplyButtonClicked();
 

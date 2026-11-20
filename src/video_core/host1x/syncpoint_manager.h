@@ -9,6 +9,8 @@
 #include <list>
 #include <mutex>
 #include <optional>
+#include <thread>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -103,6 +105,13 @@ private:
 
     void Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv, u32 expected_value);
 
+    /// Due actions an Increment took out of storage and runs after releasing `guard`.
+    struct DueActions {
+        std::list<RegisteredAction> pending; ///< Not started yet; a cancel removes them.
+        ActionHandle running{};              ///< The one being called now, 0 between calls.
+        std::thread::id thread{std::this_thread::get_id()};
+    };
+
     std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> syncpoints_guest{};
     std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> syncpoints_host{};
 
@@ -111,9 +120,11 @@ private:
 
     std::mutex guard;
     u64 last_action_id{};
-    GuestMirror guest_mirror; ///< Guarded by `guard`.
+    GuestMirror guest_mirror;             ///< Guarded by `guard`.
+    std::vector<DueActions*> due_actions; ///< Guarded by `guard`.
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
+    std::condition_variable action_done_cv;
 };
 
 } // namespace Host1x

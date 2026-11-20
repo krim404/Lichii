@@ -21,6 +21,7 @@
 
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/compute_write_grid.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
@@ -1442,7 +1443,9 @@ void BufferCache<P>::ClearFenceDownloads(DAddr device_addr, u64 size) {
 }
 
 template <class P>
-bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+bool BufferCache<P>::DMACopy(
+    GPUVAddr src_address, GPUVAddr dest_address, u64 amount,
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4>* gpu_written_dest) {
     const std::optional<DAddr> cpu_src_address = gpu_memory->GpuToCpuAddress(src_address);
     const std::optional<DAddr> cpu_dest_address = gpu_memory->GpuToCpuAddress(dest_address);
     if (!cpu_src_address || !cpu_dest_address) {
@@ -1453,6 +1456,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     if (!source_dirty && !dest_dirty) {
         return false;
     }
+    // GPU-written list words owed in either range land first (Nx2ListIndirect): the guest copy
+    // below would take the source's placeholders, and a word the copy covers in part keeps its
+    // other bytes.
+    Nx2LandOwed(*cpu_src_address, amount);
+    Nx2LandOwed(*cpu_dest_address, amount);
 
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
@@ -1493,14 +1501,19 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     for (const auto& pair : tmp_intervals) {
         gpu_modified_ranges.Add(pair.first, pair.second);
         NoteReadBackWrite(pair.first, pair.second);
-        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-            Nx2NoteListWrite(buffer_b, pair.first, pair.second);
-        }
+    }
+    // The copy rewrites all of the destination, not only the bytes that came from GPU-written
+    // source data: a command list page's copy taken before it no longer holds the page.
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        Nx2NoteListWrite(buffer_b, *cpu_dest_address, amount);
     }
     const auto& copy = copies[0];
     src_buffer.MarkUsage(copy.src_offset, copy.size);
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+    if (gpu_written_dest) {
+        *gpu_written_dest = tmp_intervals;
+    }
     if (has_new_downloads) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
@@ -1521,21 +1534,28 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     if (!cpu_dst_address) {
         return false;
     }
-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
+    // amount counts words: the range is checked in bytes, as it is cleared.
+    const size_t size = amount * sizeof(u32);
+    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, size);
     if (!dest_dirty) {
         return false;
     }
 
-    const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
     NoteUniformWrite(*cpu_dst_address, size);
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
     Buffer& dest_buffer = slot_buffers[buffer];
+    // As DMACopy: the CPU's bytes on these pages reach the buffer first. A command list page is
+    // copied from the buffer whole after the clear (Nx2CopyListPages).
+    SynchronizeBuffer(dest_buffer, *cpu_dst_address, static_cast<u32>(size));
     const u32 offset = dest_buffer.Offset(*cpu_dst_address);
     runtime.ClearBuffer(dest_buffer, offset, size, value);
     dest_buffer.MarkUsage(offset, size);
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        Nx2NoteListWrite(buffer, *cpu_dst_address, size);
+    }
     return true;
 }
 
@@ -1977,11 +1997,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             const auto& qmd = launch_desc;
             const std::array<u32, 3> block{qmd.block_dim_x.Value(), qmd.block_dim_y.Value(),
                                            qmd.block_dim_z.Value()};
-            std::optional<std::array<u32, 3>> grid;
-            if (!kepler_compute->GetIndirectComputeAddress()) {
-                grid = std::array<u32, 3>{qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
-                                          qmd.grid_dim_z.Value()};
-            }
+            const auto grid = ComputeWriteGrid(*kepler_compute);
             if (const auto extent = Shader::ResolveStorageWriteExtent(write_extent, block, grid)) {
                 // The extent counts from the pointer, the binding from the pointer aligned down.
                 const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
@@ -2256,6 +2272,39 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
+bool BufferCache<P>::ComputeWritesHoldGpuData() {
+    bool holds = true;
+    ForEachEnabledBit(channel_state->enabled_compute_storage_buffers &
+                          channel_state->written_compute_storage_buffers,
+                      [&](u32 index) {
+                          const Binding& binding = channel_state->compute_storage_buffers[index];
+                          // As much as BindHostComputeStorageBuffers marks written
+                          const bool native =
+                              ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
+                          const u32 size =
+                              native ? (std::min)(binding.size,
+                                                  channel_state->compute_storage_write_marks[index])
+                                     : binding.size;
+                          holds &= IsRegionFullyGpuModified(binding.device_addr, size);
+                      });
+    ForEachEnabledBit(channel_state->enabled_compute_texture_buffers &
+                          channel_state->written_compute_texture_buffers,
+                      [&](u32 index) {
+                          const Binding& binding = channel_state->compute_texture_buffers[index];
+                          holds &= IsRegionFullyGpuModified(binding.device_addr, binding.size);
+                      });
+    return holds;
+}
+
+template <class P>
+bool BufferCache<P>::IsRegionFullyGpuModified(DAddr addr, size_t size) {
+    size_t covered = 0;
+    gpu_modified_ranges.ForEachInRange(addr, size,
+                                       [&](DAddr lower, DAddr upper) { covered += upper - lower; });
+    return covered == size;
+}
+
+template <class P>
 bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
     const DAddr end_addr = addr + size;
     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
@@ -2527,10 +2576,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
 template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
-    // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
-    // bind: stream the table's current words as that buffer.
+    // Banks 24-31 (the root tables; NVN2 keeps push constants in table 0) are read from bank 17,
+    // which such games do not bind: stream the tables' current words, one after another, as that
+    // buffer.
     if (index == 17 && maxwell3d->root_tables.loaded && channel_state->uniform_buffers[stage][index].size == 0) {
-        const auto& words = maxwell3d->root_tables.tables[0];
+        const auto& words = maxwell3d->root_tables.tables;
+        static_assert(sizeof(words) == 8 * 256);
         const u32 size = (*channel_state->uniform_buffer_sizes)[stage][index];
         const u32 copied = (std::min)(size, static_cast<u32>(sizeof(words)));
         if constexpr (IS_OPENGL) {
@@ -2562,7 +2613,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     bool verify_kept = false;
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
         // Unnoticed writes would reach a kept bank too: those stream as before.
-        if (!native_bank && UniformRangeKept(stage, index, device_addr, size)) {
+        // A range with GPU-written list words owed in it streams: they go over the stream
+        // (Nx2ListIndirect).
+        if (!native_bank && !Nx2Owes(device_addr, size) &&
+            UniformRangeKept(stage, index, device_addr, size)) {
             if (ubo_keep_verify) {
                 // Only the ranges RebindKeptUniform would bind again: the others are streamed.
                 if (VideoCommon::KeptUniformMatches(runtime, stage, index, device_addr, size)) {
@@ -2648,7 +2702,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // The same bytes as this slot's previous bind, in the same command buffer: bind that
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
             // EDEN_NX2_UBOREUSE=0 turns it off.
-            if (VideoCommon::UniformStreamReuseEnabled()) {
+            if (VideoCommon::UniformStreamReuseEnabled() && !Nx2Owes(device_addr, size)) {
                 streamed = VideoCommon::BindSmallUniformReusing(
                     runtime, device_memory, stage, index, binding_index, device_addr, size);
                 if (streamed) {
@@ -2661,6 +2715,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         if (!streamed) {
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+            if constexpr (requires { runtime.LastStreamUniformRef().buffer; }) {
+                const auto stream = runtime.LastStreamUniformRef();
+                Nx2PatchOwed(device_addr, size, stream.buffer, stream.offset,
+                             Tegra::Nx2ListIndirect::OwedReader::GraphicsUniform);
+            }
         }
         return;
     }
@@ -2670,7 +2729,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                   "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} is no longer streamed",
                   stage, index, device_addr, size);
     }
-    if (SynchronizeBuffer(buffer, device_addr, size)) {
+    if (SynchronizeBuffer(buffer, device_addr, size,
+                          Tegra::Nx2ListIndirect::OwedReader::GraphicsUniform)) {
         ++channel_state->uniform_cache_hits[0];
     }
     // Skip binding if it's not needed and if the bound buffer is not the fast version
@@ -2921,11 +2981,16 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                 const std::span<u8> span =
                     runtime.BindMappedUniformBuffer(0, binding_index, size);
                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
+                // GPU-written list words owed there go over their placeholders (Nx2ListIndirect).
+                const auto stream = runtime.LastStreamUniformRef();
+                Nx2PatchOwed(binding.device_addr, size, stream.buffer, stream.offset,
+                             Tegra::Nx2ListIndirect::OwedReader::ComputeUniform);
                 return;
             }
         }
 
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        SynchronizeBuffer(buffer, binding.device_addr, size,
+                          Tegra::Nx2ListIndirect::OwedReader::ComputeUniform);
 
         buffer.MarkUsage(offset, size);
         if constexpr (NEEDS_BIND_UNIFORM_INDEX) {
@@ -3057,8 +3122,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            ++buffer_deletions;
-            slot_buffers.erase(inline_buffer_id);
+            DeleteBuffer(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -3276,6 +3340,8 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
             buffer.setWriteTick(runtime.CurrentTick());
         }
     }
+    Nx2WidenOverOwed(slot_buffers[buffer_id], device_addr, size);
+    Nx2ForgetOwed(device_addr, size);
     // The downloads already taken over this range hold older bytes: when their fences pop
     // they must not write them over this write's result in guest memory, nor drop the range
     // from gpu_modified_ranges (the next fence downloads it instead).
@@ -3369,7 +3435,21 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             if (begin >= end) {
                 continue;
             }
-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
+            // A copy recorded earlier in the open tick is read only once the tick is done, after
+            // this one: copy into its buffer again.
+            std::optional<Nx2Staging> open_copy;
+            {
+                std::scoped_lock lock{nx2_list_mutex};
+                const auto it = nx2_list_pages.find(page);
+                if (it != nx2_list_pages.end() && it->second.copy &&
+                    it->second.copy_tick == runtime.CurrentTick()) {
+                    open_copy = it->second.copy;
+                }
+            }
+            Nx2Profile::Add(Nx2Profile::Counter::ListCopies, 1);
+            Nx2Profile::Add(Nx2Profile::Counter::ListCopiesReused, open_copy ? 1 : 0);
+            const Nx2Staging staging =
+                open_copy ? *open_copy : runtime.DownloadStagingBuffer(page_size, true);
             const BufferCopy copy{
                 .src_offset = buffer.Offset(begin),
                 .dst_offset = staging.offset + (begin - page),
@@ -3380,7 +3460,7 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             recorded = true;
             std::scoped_lock lock{nx2_list_mutex};
             Nx2ListPage& entry = nx2_list_pages[page];
-            if (entry.copy) {
+            if (entry.copy && !open_copy) {
                 nx2_retired_list_copies.emplace_back(entry.copy_tick, std::move(*entry.copy));
             }
             entry.copy = staging;
@@ -3414,7 +3494,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             return Nx2ListRead::Unknown;
         }
         const auto current = [&](const Nx2ListPage& entry) {
-            return entry.copy && !entry.draw_written && entry.copy_writes == entry.writes &&
+            return entry.copy && entry.copy_writes == entry.writes &&
                    offset >= entry.copy_begin && offset + out.size() <= entry.copy_end;
         };
         u64 tick{};
@@ -3435,8 +3515,8 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 if (!past_sync) {
                     return Nx2ListRead::NeedsSync;
                 }
-                return entry.synced_writes == entry.writes ? Nx2ListRead::Synced
-                                                           : Nx2ListRead::Unknown;
+                // Past the sync the back noted every write the list can see: a copy made after
+                // the last of them holds the page, without a flush and Scheduler::Finish.
             }
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
             if (entry.synced_writes == entry.writes) {
@@ -3771,13 +3851,14 @@ template <bool insert>
 void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
+    const u64 allocated = Common::AlignUp(size + runtime.GetBufferAllocationTail(), 1024);
     if (insert) {
-        buffer_bytes += Common::AlignUp(size, 1024);
-        total_used_memory += Common::AlignUp(size, 1024);
+        buffer_bytes += allocated;
+        total_used_memory += allocated;
         buffer.setLRUID(lru_cache.Insert(buffer_id, frame_tick));
     } else {
-        buffer_bytes -= Common::AlignUp(size, 1024);
-        total_used_memory -= Common::AlignUp(size, 1024);
+        buffer_bytes -= allocated;
+        total_used_memory -= allocated;
         lru_cache.Free(buffer.getLRUID());
     }
     const DAddr device_addr_begin = buffer.CpuAddr();
@@ -3801,7 +3882,21 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
 }
 
 template <class P>
-bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size,
+                                       Tegra::Nx2ListIndirect::OwedReader reader) {
+    const bool uploaded_nothing = UploadModifiedMemory(buffer, device_addr, size);
+    if constexpr (requires { buffer.Handle(); }) {
+        const u32 offset = buffer.Offset(device_addr);
+        if (Nx2PatchOwed(device_addr, size, buffer.Handle(), offset, reader)) {
+            // As ObtainIndirectBuffer: a later upload must not be reordered ahead of the copies.
+            buffer.MarkUsage(offset, size);
+        }
+    }
+    return uploaded_nothing;
+}
+
+template <class P>
+bool BufferCache<P>::UploadModifiedMemory(Buffer& buffer, DAddr device_addr, u32 size) {
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
     const bool skip_clean = !Nx2Perf::Verify();
@@ -4238,6 +4333,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
 
     Unregister(buffer_id);
+    if (buffer_id == inline_buffer_id) {
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
 
 #ifdef LICHII_LEGACY
     if (!do_not_mark || !immediately_free)

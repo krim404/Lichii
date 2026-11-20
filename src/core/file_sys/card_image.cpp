@@ -306,17 +306,17 @@ Loader::ResultStatus XCI::AddNCAFromPartition(XCIPartition part) {
         if (nca->IsUpdate()) {
             continue;
         }
-        if (nca->GetType() == NCAContentType::Program) {
-            program_nca_status = nca->GetStatus();
-        }
-        if (nca->GetStatus() == Loader::ResultStatus::Success) {
-            ncas.push_back(std::move(nca));
-        } else {
+        if (nca->GetStatus() != Loader::ResultStatus::Success) {
             const u16 error_id = static_cast<u16>(nca->GetStatus());
             LOG_CRITICAL(Loader, "Could not load NCA {}/{}, failed with error code {:04X} ({})",
                          partition_names[partition_index], nca->GetName(), error_id,
                          nca->GetStatus());
+            continue;
         }
+        if (nca->GetType() == NCAContentType::Program) {
+            program_nca_status = nca->GetStatus();
+        }
+        ncas.push_back(std::move(nca));
     }
 
     return Loader::ResultStatus::Success;

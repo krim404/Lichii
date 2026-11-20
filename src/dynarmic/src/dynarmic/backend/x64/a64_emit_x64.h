@@ -101,7 +101,7 @@ public:
     };
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
-    FakeCall FastmemCallback(u64 rip);
+    std::optional<FakeCall> FastmemCallback(u64 rip);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);

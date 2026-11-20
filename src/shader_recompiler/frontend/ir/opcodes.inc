@@ -23,6 +23,9 @@ OPCODE(EndPrimitive,                                        Void,           U32,
 OPCODE(Barrier,                                             Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
+OPCODE(BarrierVoteInit,                                     Void,           U32,                                                                            )
+OPCODE(BarrierVote,                                         Void,           U1,             U32,            U32,                                            )
+OPCODE(VotedBarrier,                                        Void,           U32,            U32,                                                            )
 
 // Context getters/setters
 OPCODE(GetRegister,                                         U32,            Reg,                                                                            )
@@ -48,6 +51,7 @@ OPCODE(SetAttributeIndexed,                                 Void,           U32,
 OPCODE(GetPatch,                                            F32,            Patch,                                                                          )
 OPCODE(SetPatch,                                            Void,           Patch,          F32,                                                            )
 OPCODE(IsbeRead,                                            U32,            U32,                                                                            )
+OPCODE(IsbeReadOutput,                                      U32,            U32,                                                                            )
 OPCODE(IsbeWriteAttribute,                                  Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU8,                                      Void,           U32,            U32,                                                            )
 OPCODE(IsbeWriteMapU32,                                     Void,           U32,            U32,                                                            )

@@ -895,7 +895,51 @@ QPushButton#DockingStatusBarButton {
     border-radius: 5px;
     background-color: #202125;
     color: #c4c5ca;
-    font-size: 11px;
+    font-size: 8pt;
+}
+
+/* One color per chip category; the :!checked rule below greys out chips that are off. */
+
+/* GPU accuracy */
+QPushButton#GPUStatusBarButton[chip="gpu"] {
+    background-color: rgba(245, 185, 66, 0.14);
+    color: #f5b942;
+}
+
+/* dock mode */
+QPushButton#DockingStatusBarButton[chip="dock"] {
+    background-color: rgba(96, 165, 250, 0.14);
+    color: #60a5fa;
+}
+
+/* scaling filter */
+QPushButton#TogglableStatusBarButton[chip="filter"] {
+    background-color: rgba(167, 139, 250, 0.14);
+    color: #a78bfa;
+}
+
+/* anti-aliasing */
+QPushButton#TogglableStatusBarButton[chip="aa"] {
+    background-color: rgba(34, 211, 238, 0.14);
+    color: #22d3ee;
+}
+
+/* post effects */
+QPushButton#TogglableStatusBarButton[chip="fx"] {
+    background-color: rgba(163, 217, 94, 0.14);
+    color: #a3d95e;
+}
+
+/* frame generation */
+QPushButton#TogglableStatusBarButton[chip="fg"] {
+    background-color: rgba(255, 138, 76, 0.14);
+    color: #ff8a4c;
+}
+
+/* volume */
+QPushButton#TogglableStatusBarButton[chip="volume"] {
+    background-color: rgba(232, 121, 249, 0.14);
+    color: #e879f9;
 }
 
 QPushButton#TogglableStatusBarButton:!checked {
@@ -941,6 +985,11 @@ QPushButton#button_reset_defaults {
 
 /* Controller applet, input pages and software keyboard (from qdarkstyle) ----- */
 
+/* Set by the Configure dialog on a page that is wider than the screen. */
+QWidget[compactPage="true"] QPushButton {
+    padding: 0 6px;
+}
+
 QSpinBox#spinboxLStickRange,
 QSpinBox#spinboxRStickRange,
 QSpinBox#vibrationSpinPlayer1,
@@ -950,7 +999,8 @@ QSpinBox#vibrationSpinPlayer4,
 QSpinBox#vibrationSpinPlayer5,
 QSpinBox#vibrationSpinPlayer6,
 QSpinBox#vibrationSpinPlayer7,
-QSpinBox#vibrationSpinPlayer8 {
+QSpinBox#vibrationSpinPlayer8,
+QSpinBox#spinTriggerRumble {
     min-width: 68px;
 }
 

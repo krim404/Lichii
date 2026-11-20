@@ -1,20 +1,19 @@
 version: 2.1
 
-# Placeholder until the build jobs land: a cheap job so the CircleCI check passes on every
-# pipeline. The real build-check mirror replaces it.
+# CircleCI is off: the free plan ran out of credits. No workflow runs, so no pipeline spends any.
+# The full config (Linux x86_64 and aarch64 on every PR, nightly Windows, opt-in macOS) is in
+# git history: git checkout 7482eb55ea -- .circleci/config.yml
 
 jobs:
-  config-check:
+  noop:
     docker:
       - image: cimg/base:current
     resource_class: small
     steps:
-      - checkout
-      - run:
-          name: Check the CircleCI config is in place
-          command: test -s .circleci/config.yml
+      - run: "true"
 
 workflows:
-  build-check:
+  disabled:
+    when: false
     jobs:
-      - config-check
+      - noop

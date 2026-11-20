@@ -29,8 +29,9 @@ public:
 
     void Process(const Device& device, Frame* frame, VkFormat format, VkExtent2D guest_extent);
 
+    /// free_frames: the present frames free now (PresentManager::FreeFrames).
     /// blocked: the time the renderer waited for the present thread since the last call.
-    [[nodiscard]] size_t WantedGenerations(size_t capacity,
+    [[nodiscard]] size_t WantedGenerations(size_t capacity, size_t free_frames,
                                            std::chrono::steady_clock::duration blocked = {});
 
     [[nodiscard]] size_t GeneratedFrameCount() const;

@@ -19,6 +19,9 @@
 
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/arm_hypervisor.h"
+#endif
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
 #endif
@@ -178,6 +181,9 @@ void KProcess::Finalize(KernelCore& kernel) {
     for (auto& interface : m_arm_interfaces) {
         interface.reset();
     }
+#ifdef HAS_HYPERVISOR
+    m_memory.ReleaseHypervisor();
+#endif
     m_exclusive_monitor.reset();
 
     // Perform inherited finalization.
@@ -320,10 +326,13 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     }
     ON_RESULT_FAILURE_2 {
         m_page_table.Finalize();
+#ifdef HAS_HYPERVISOR
+        m_memory.ReleaseHypervisor();
+#endif
     };
 
     // Ensure our memory is initialized.
-    m_memory.SetCurrentPageTable(*this);
+    m_memory.SetCurrentPageTable(*this, params.flags);
     m_memory.SetGPUDirtyManagers(kernel.System().GetGPUDirtyMemoryManager());
 
     // Ensure we can insert the code region.
@@ -422,10 +431,13 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     }
     ON_RESULT_FAILURE_2 {
         m_page_table.Finalize();
+#ifdef HAS_HYPERVISOR
+        m_memory.ReleaseHypervisor();
+#endif
     };
 
     // Ensure our memory is initialized.
-    m_memory.SetCurrentPageTable(*this);
+    m_memory.SetCurrentPageTable(*this, params.flags);
     m_memory.SetGPUDirtyManagers(kernel.System().GetGPUDirtyMemoryManager());
 
     // Ensure we can insert the code region.
@@ -1289,7 +1301,7 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
 #ifdef HAS_NCE
     const auto& patch = code_set.PatchSegment();
     const auto& post_patch = code_set.PostPatchSegment();
-    if (this->IsApplication() && Settings::IsNceEnabled() && patch.size != 0) {
+    if (this->UsesNativeExecution() && patch.size != 0) {
         auto& buffer = kernel.System().DeviceMemory().buffer;
         const auto& code = code_set.CodeSegment();
         buffer.Protect(GetInteger(base_addr + code.addr), code.size,
@@ -1309,12 +1321,32 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
 #endif
 }
 
+#ifdef HAS_HYPERVISOR
+void KProcess::ReleaseHypervisor() {
+    if (m_memory.GetHypervisor()) {
+        for (auto& interface : m_arm_interfaces) {
+            interface.reset();
+        }
+        m_memory.ReleaseHypervisor();
+    }
+}
+#endif
+
 void KProcess::InitializeInterfaces(KernelCore& kernel) {
     m_exclusive_monitor =
         Core::MakeExclusiveMonitor(this->GetMemory(), Core::Hardware::NUM_CPU_CORES);
 
+#ifdef HAS_HYPERVISOR
+    if (auto vm = m_memory.GetHypervisor()) {
+        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+            m_arm_interfaces[i] = std::make_unique<Core::ArmHypervisor>(vm, i);
+        }
+        return;
+    }
+#endif
+
 #ifdef HAS_NCE
-    if (this->IsApplication() && Settings::IsNceEnabled()) {
+    if (this->UsesNativeExecution()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++)
             m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
     } else

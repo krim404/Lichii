@@ -104,12 +104,6 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
         return {ResultStatus::ErrorAlreadyLoaded, {}};
     }
 
-    const auto title_id = nsp->GetProgramTitleID();
-
-    if (!nsp->IsExtractedType() && title_id == 0) {
-        return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
-    }
-
     const auto nsp_status = nsp->GetStatus();
     if (nsp_status != ResultStatus::Success) {
         return {nsp_status, {}};
@@ -118,6 +112,12 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
     const auto nsp_program_status = nsp->GetProgramStatus();
     if (nsp_program_status != ResultStatus::Success) {
         return {nsp_program_status, {}};
+    }
+
+    const auto title_id = nsp->GetProgramTitleID();
+
+    if (!nsp->IsExtractedType() && title_id == 0) {
+        return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
     }
 
     if (!nsp->IsExtractedType() &&
@@ -303,6 +303,14 @@ ResultStatus AppLoader_NSP::ReadNSOModules(Modules& modules) {
         return ResultStatus::ErrorNSPMissingProgramNCA;
     }
     return secondary_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NSP::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    return secondary_loader->ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

@@ -211,4 +211,9 @@ ResultStatus AppLoader_XCI::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_XCI::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    return nca_loader->ReadMainBuildId(system, build_id);
+}
+
 } // namespace Loader

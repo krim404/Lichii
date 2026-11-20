@@ -17,11 +17,10 @@ TEST_CASE("Native pending draws are never discarded", "[video_core][async_draw]"
     }
 }
 
-/// EDEN_NX2_ASYNC_DISCARD=1: native draws use the legacy heuristic; non-native draws are unchanged.
-TEST_CASE("Native pending draws follow the async heuristic when opted in",
+TEST_CASE("Native pending draws with depth can be discarded when opted in",
           "[video_core][async_draw]") {
     REQUIRE(Vulkan::CanDiscardPendingDraw(true, true, 0, 0, true));
-    REQUIRE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 6, 100, true));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 0, 0, true));
     // The opt-in never changes non-native draws.
@@ -30,10 +29,44 @@ TEST_CASE("Native pending draws follow the async heuristic when opted in",
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 0, 0, true));
 }
 
+TEST_CASE("Star Fox font atlas draws wait even when the native wait budget is exhausted",
+          "[video_core][async_draw][native_pending]") {
+    constexpr std::array<u32, 4> glyph_counts{30, 96, 384, 672};
+    for (const u32 count : glyph_counts) {
+        const bool can_discard = Vulkan::CanDiscardPendingDraw(true, false, count, count, true);
+        for (const auto mode : {Vulkan::NativePendingMode::Wait, Vulkan::NativePendingMode::Bounded,
+                                Vulkan::NativePendingMode::Skip}) {
+            for (const s64 budget : {8000, 0, -500}) {
+                REQUIRE(Vulkan::DecideNativePending(mode, can_discard, budget) ==
+                        Vulkan::NativeDrawAction::Wait);
+            }
+        }
+    }
+}
+
 TEST_CASE("Legacy pending draws retain the async heuristic", "[video_core][async_draw]") {
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, true, 0, 0));
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, false, 7, 7));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 6, 100));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 100, 6));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 0, 0));
+}
+
+TEST_CASE("A native draw needs history on every render target it writes, through the RT map",
+          "[video_core][async_draw]") {
+    const auto identity = [](u32 i) { return i; };
+    const auto to_rt1 = [](u32) { return 1u; };
+    const auto writes_all = [](u32) { return true; };
+    const auto rt0_only = [](u32 rt) { return rt == 0; };
+    const auto none = [](u32) { return false; };
+    // Output 0 maps to RT1: RT0's history must not let a first write into RT1 be skipped.
+    REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(1, to_rt1, writes_all, rt0_only));
+    REQUIRE(Vulkan::ColorWritesHaveHistory(1, to_rt1, writes_all, writes_all));
+    REQUIRE(Vulkan::ColorWritesHaveHistory(1, identity, writes_all, rt0_only));
+    // Two outputs, one into a target first written this frame.
+    REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(2, identity, writes_all, rt0_only));
+    // A masked output needs no history; a draw that writes no color is not skippable.
+    REQUIRE(Vulkan::ColorWritesHaveHistory(2, identity, rt0_only, rt0_only));
+    REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(2, identity, none, writes_all));
+    REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(0, identity, writes_all, writes_all));
 }

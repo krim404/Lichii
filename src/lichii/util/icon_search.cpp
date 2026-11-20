@@ -21,6 +21,7 @@
 
 #include <QBuffer>
 #include <QByteArray>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QIcon>
@@ -35,11 +36,9 @@
 
 #include "common/httplib.h"
 #include "common/logging.h"
+#include "common/net/ca_store.h"
 #include "common/string_util.h"
 #include "qt_common/config/uisettings.h"
-#ifdef LICHII_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
 
 namespace {
 
@@ -157,6 +156,11 @@ std::string UrlEncode(std::string_view value) {
 constexpr std::chrono::seconds SearchDeadline{10};
 constexpr std::size_t MaxHttpBodySize = 4 * 1024 * 1024;
 constexpr std::chrono::seconds PrimarySourceDeadline{5};
+// cpp-httplib cannot be interrupted from another thread while it connects or waits for the first
+// bytes of a reply, so these waits are kept short: a cancelled lookup ends within them instead of
+// at the deadline of the whole search. A download in progress stops on cancel right away.
+constexpr std::chrono::milliseconds ConnectTimeout{5000};
+constexpr std::chrono::milliseconds ReadTimeout{8000};
 constexpr std::string_view IconSiteHost = "https://switchiconshowdown.com";
 constexpr std::string_view SgdbApiBase = "https://www.steamgriddb.com/api/v2";
 
@@ -203,21 +207,22 @@ HttpResult HttpGet(const std::string& full_url, std::chrono::steady_clock::time_
     }
     try {
         httplib::Client client(origin);
-        client.set_connection_timeout(remaining);
-        client.set_read_timeout(remaining);
-        client.set_write_timeout(remaining);
+        client.set_connection_timeout(std::min(remaining, ConnectTimeout));
+        client.set_read_timeout(std::min(remaining, ReadTimeout));
+        client.set_write_timeout(std::min(remaining, ConnectTimeout));
         client.set_max_timeout(remaining);
         client.set_follow_location(true);
-#ifdef LICHII_BUNDLED_OPENSSL
-        client.load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(client);
         httplib::Headers headers{{"User-Agent", "Lichii"}};
         if (!bearer_token.empty()) {
             headers.emplace("Authorization", "Bearer " + bearer_token);
         }
-        auto res = client.Get(path, headers);
+        // Stops a download in progress as soon as cancel is set, not only at the deadline.
+        auto res = client.Get(path, headers, [&cancel](size_t, size_t) { return !cancel.load(); });
         if (!res) {
-            result.status = res.error() == httplib::Error::Canceled || steady_clock::now() >= deadline
+            result.status = cancel ? HttpStatus::Cancelled
+                            : res.error() == httplib::Error::Canceled ||
+                                    steady_clock::now() >= deadline
                                 ? HttpStatus::Timeout
                                 : HttpStatus::NetworkError;
             result.detail = httplib::to_string(res.error());
@@ -539,6 +544,154 @@ IconSearchResult RunIconSearch(const std::string& raw_query, u64 tid, const std:
 }
 
 } // namespace
+
+ArtworkLookupResult LookUpSteamGridDbArtwork(const std::string& title, const std::string& api_key,
+                                             const std::atomic_bool& cancel, bool prefer_newest) {
+    ArtworkLookupResult out;
+    // A trailing "(2026)" is not part of the name SteamGridDB knows; it says which release.
+    std::string search_title = title;
+    int wanted_year = 0;
+    if (const auto open = search_title.rfind('(');
+        open != std::string::npos && open > 0 && search_title.ends_with(')')) {
+        const std::string inner = search_title.substr(open + 1, search_title.size() - open - 2);
+        if (inner.size() == 4 && std::ranges::all_of(inner, [](unsigned char c) {
+                return std::isdigit(c) != 0;
+            })) {
+            wanted_year = std::stoi(inner);
+            search_title.erase(open);
+            while (!search_title.empty() &&
+                   std::isspace(static_cast<unsigned char>(search_title.back()))) {
+                search_title.pop_back();
+            }
+        }
+    }
+    if (title.empty() || search_title.empty() || api_key.empty()) {
+        out.status = ArtworkLookupStatus::NotFound;
+        return out;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    const auto failed = [&out](const HttpResult& res) {
+        out.status = res.status == HttpStatus::Unauthorized ? ArtworkLookupStatus::BadApiKey
+                     : res.status == HttpStatus::Cancelled  ? ArtworkLookupStatus::Cancelled
+                                                            : ArtworkLookupStatus::NetworkError;
+        out.detail = res.detail;
+        return out;
+    };
+    const auto sgdb_get = [&](const std::string& path) {
+        return HttpGet(std::string{SgdbApiBase} + path, deadline, cancel, api_key);
+    };
+    try {
+        const auto search =
+            sgdb_get("/search/autocomplete/" + UrlEncodePathSegment(search_title));
+        if (search.status != HttpStatus::Ok) {
+            return failed(search);
+        }
+        // The first autocomplete entry is SteamGridDB's best match. Entries with the same name
+        // are other releases of it (an original and its remake); the year picks between them.
+        struct Entry {
+            int id{};
+            std::string name;
+            int year{};
+            s64 release{};
+        };
+        std::vector<Entry> entries;
+        const auto parsed = nlohmann::json::parse(search.body, nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("data") &&
+            parsed["data"].is_array()) {
+            for (const auto& item : parsed["data"]) {
+                if (!item.is_object() || !item.contains("id") || !item["id"].is_number_integer()) {
+                    continue;
+                }
+                Entry entry{.id = item["id"].get<int>()};
+                if (item.contains("name") && item["name"].is_string()) {
+                    entry.name = item["name"].get<std::string>();
+                }
+                if (item.contains("release_date") && item["release_date"].is_number_integer()) {
+                    entry.release = item["release_date"].get<s64>();
+                    entry.year =
+                        QDateTime::fromSecsSinceEpoch(entry.release).toUTC().date().year();
+                }
+                entries.push_back(std::move(entry));
+            }
+        }
+        const auto simple_name = [](const std::string& name) {
+            std::string out_name;
+            for (const unsigned char c : name) {
+                if (std::isalnum(c)) {
+                    out_name += static_cast<char>(std::tolower(c));
+                }
+            }
+            return out_name;
+        };
+        int game_id = 0;
+        if (!entries.empty()) {
+            const Entry* chosen = &entries.front();
+            const std::string best_name = simple_name(chosen->name);
+            const std::string searched_name = simple_name(search_title);
+            // The year only picks between releases of the game: an entry of that year with
+            // another name is a different game.
+            const Entry* same_name_in_year = nullptr;
+            const Entry* searched_name_in_year = nullptr;
+            if (wanted_year != 0) {
+                for (const auto& entry : entries) {
+                    const std::string name = simple_name(entry.name);
+                    // Names with no ASCII letters or digits (Japanese-only) all match each other.
+                    if (entry.year != wanted_year || name.empty()) {
+                        continue;
+                    }
+                    if (!same_name_in_year && name == best_name) {
+                        same_name_in_year = &entry;
+                    }
+                    if (!searched_name_in_year && name == searched_name) {
+                        searched_name_in_year = &entry;
+                    }
+                }
+            }
+            if (same_name_in_year || searched_name_in_year) {
+                chosen = same_name_in_year ? same_name_in_year : searched_name_in_year;
+            } else if (prefer_newest && !best_name.empty()) {
+                for (const auto& entry : entries) {
+                    if (simple_name(entry.name) == best_name && entry.release > chosen->release) {
+                        chosen = &entry;
+                    }
+                }
+            }
+            game_id = chosen->id;
+        }
+        if (game_id <= 0) {
+            out.status = ArtworkLookupStatus::NotFound;
+            return out;
+        }
+        // Square grids first, then icons.
+        for (const auto& list_path :
+             {fmt::format("/grids/game/{}?dimensions=512x512,1024x1024", game_id),
+              fmt::format("/icons/game/{}", game_id)}) {
+            const auto list = sgdb_get(list_path);
+            if (list.status != HttpStatus::Ok) {
+                return failed(list);
+            }
+            for (const auto& url : ParseSgdbIconUrls(list.body)) {
+                const auto image = HttpGet(url, deadline, cancel);
+                if (image.status == HttpStatus::Cancelled || image.status == HttpStatus::Timeout) {
+                    return failed(image);
+                }
+                QImage decoded;
+                if (image.status == HttpStatus::Ok &&
+                    decoded.loadFromData(reinterpret_cast<const uchar*>(image.body.data()),
+                                         static_cast<int>(image.body.size()))) {
+                    out.status = ArtworkLookupStatus::Found;
+                    out.image = std::move(decoded);
+                    return out;
+                }
+            }
+        }
+        out.status = ArtworkLookupStatus::NotFound;
+    } catch (const std::exception& e) {
+        out.status = ArtworkLookupStatus::NetworkError;
+        out.detail = e.what();
+    }
+    return out;
+}
 
 IconSearch::IconSearch(QWidget* parent) : QObject(parent), parent_widget{parent} {
     connect(&watcher, &QFutureWatcher<IconSearchResult>::finished, this, &IconSearch::OnFinished);

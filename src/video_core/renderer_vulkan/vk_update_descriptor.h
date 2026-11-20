@@ -65,6 +65,10 @@ public:
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
     }
 
+    void ReplaceSampledImage(size_t entry, VkImageView image_view) {
+        upload_start[entry].image.imageView = image_view;
+    }
+
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
         *(payload_cursor++) = VkDescriptorImageInfo{
             .sampler = sampler,
@@ -134,7 +138,7 @@ private:
     size_t frame_index{0};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
-    const DescriptorUpdateEntry* upload_start = nullptr;
+    DescriptorUpdateEntry* upload_start = nullptr;
     std::unique_ptr<DescriptorUpdateEntry[]> payload;
     bool growth_disabled{};
     bool fallback_reported{};

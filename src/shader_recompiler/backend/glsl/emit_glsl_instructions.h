@@ -33,6 +33,9 @@ void EmitDemoteToHelperInvocation(EmitContext& ctx);
 void EmitBarrier(EmitContext& ctx);
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
 void EmitDeviceMemoryBarrier(EmitContext& ctx);
+void EmitBarrierVoteInit(EmitContext& ctx, u32 offset);
+void EmitBarrierVote(EmitContext& ctx, std::string_view cond, u32 offset, u32 size);
+void EmitVotedBarrier(EmitContext& ctx, u32 offset, u32 size);
 void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
 void EmitEmitVertex(EmitContext& ctx, const IR::Value& stream);
@@ -72,6 +75,7 @@ void EmitSetAttributeIndexed(EmitContext& ctx, std::string_view offset, std::str
 void EmitGetPatch(EmitContext& ctx, IR::Inst& inst, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, std::string_view value);
 void EmitIsbeRead(EmitContext& ctx);
+void EmitIsbeReadOutput(EmitContext& ctx);
 void EmitIsbeWriteAttribute(EmitContext& ctx);
 void EmitIsbeWriteMapU8(EmitContext& ctx);
 void EmitIsbeWriteMapU32(EmitContext& ctx);

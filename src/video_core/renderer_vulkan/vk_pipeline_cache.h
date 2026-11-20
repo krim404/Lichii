@@ -33,9 +33,10 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/bounded_store.h"
+#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/mesh_vertex_input.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -145,6 +146,16 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline(u64& native_key);
 
+    /// Whether a Switch 2 dispatch whose compute pipeline is still building is skipped instead
+    /// of waiting for the build, as native_async_draws decides for draws. Skipping leaves the
+    /// dispatch's outputs as they are, which costs a frame of its work only when shaders wrote
+    /// them before (a pass the game runs every frame); otherwise they would keep a clear value
+    /// or whatever the guest left there, so those dispatches wait. A Bounded wait takes from the
+    /// draws' budget.
+    /// @param outputs_hold_gpu_data Every buffer byte the dispatch writes holds GPU writes, and
+    ///                              every image level it writes holds storage writes.
+    [[nodiscard]] bool SkipUnbuiltDispatch(ComputePipeline& pipeline, bool outputs_hold_gpu_data);
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -160,6 +171,10 @@ private:
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
+    /// How native work with an unbuilt pipeline is handled: native_async_draws, or Skip with
+    /// EDEN_NX2_ASYNC_DISCARD=1.
+    [[nodiscard]] NativePendingMode NativeMode() const;
+
     /// How the current draw treats an unbuilt pipeline (native_async_draws, CanDiscardPendingDraw).
     struct PendingDrawPolicy {
         bool native;
@@ -168,8 +183,8 @@ private:
     };
     [[nodiscard]] PendingDrawPolicy CurrentPendingDrawPolicy() const;
 
-    /// Charges the time since `begin` to this frame's native wait budget.
-    void ChargeNativeWait(std::chrono::steady_clock::time_point begin);
+    /// Logs the bounded waits' time every 10 s.
+    void LogBoundedWaits();
 
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now. `evicted`: a pipeline of this key was evicted.
@@ -311,8 +326,9 @@ private:
     void QueueVulkanPipelineCacheFlush();
 
     /// Queues one write of the driver pipeline cache file on the serialization thread, with no
-    /// throttle. For the end of a precache: its builds never reach the timed flush, which counts
-    /// only pipelines built during play.
+    /// throttle, or writes it now where reading the cache during a build crashes. For the end of
+    /// a precache: its builds never reach the timed flush, which counts only pipelines built
+    /// during play.
     void QueueVulkanPipelineCacheSave();
 
     /// One build of the shader precache: a compute pipeline built and destroyed
@@ -355,6 +371,12 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// Native mesh draws' vertex input, lent by the first key of each pipeline
+    MeshVertexInputs<GraphicsPipelineCacheKey> mesh_vertex_inputs;
+    /// mesh_vertex_inputs holds the mesh pipelines the boot load built
+    bool mesh_vertex_inputs_seeded{};
+    /// graphics_key holds vertex input another key lent it instead of the registers'
+    bool vertex_input_lent{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

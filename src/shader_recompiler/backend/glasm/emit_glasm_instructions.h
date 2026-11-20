@@ -31,6 +31,9 @@ void EmitDemoteToHelperInvocation(EmitContext& ctx);
 void EmitBarrier(EmitContext& ctx);
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx);
 void EmitDeviceMemoryBarrier(EmitContext& ctx);
+void EmitBarrierVoteInit(EmitContext& ctx);
+void EmitBarrierVote(EmitContext& ctx);
+void EmitVotedBarrier(EmitContext& ctx);
 void EmitPrologue(EmitContext& ctx);
 void EmitEpilogue(EmitContext& ctx);
 void EmitEmitVertex(EmitContext& ctx, ScalarS32 stream);
@@ -58,6 +61,7 @@ void EmitSetAttributeIndexed(EmitContext& ctx, ScalarU32 offset, ScalarF32 value
 void EmitGetPatch(EmitContext& ctx, IR::Inst& inst, IR::Patch patch);
 void EmitSetPatch(EmitContext& ctx, IR::Patch patch, ScalarF32 value);
 void EmitIsbeRead(EmitContext& ctx);
+void EmitIsbeReadOutput(EmitContext& ctx);
 void EmitIsbeWriteAttribute(EmitContext& ctx);
 void EmitIsbeWriteMapU8(EmitContext& ctx);
 void EmitIsbeWriteMapU32(EmitContext& ctx);

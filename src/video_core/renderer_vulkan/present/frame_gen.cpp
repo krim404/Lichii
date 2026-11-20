@@ -406,7 +406,8 @@ void FrameGen::LogActivity() {
         if (activity.generated == 0) {
             LOG_INFO(Render_Vulkan,
                      "Frame generation ({}) idle: {:.0f} game FPS, no frames generated. It waits "
-                     "while the game is below 10 FPS, after hitches and once the target is met",
+                     "while the game is below 10 FPS, after hitches, once the target is met and "
+                     "while the display takes no more presents",
                      ModeText(built_type), static_cast<f32>(activity.frames) / seconds);
         } else {
             LOG_INFO(Render_Vulkan,
@@ -422,13 +423,14 @@ void FrameGen::LogActivity() {
     activity.generated = 0;
 }
 
-size_t FrameGen::WantedGenerations(size_t capacity,
+size_t FrameGen::WantedGenerations(size_t capacity, size_t free_frames,
                                    std::chrono::steady_clock::duration blocked) {
     if (unavailable) {
         plan = {};
         return 0;
     }
     plan = pacer.Plan(capacity, blocked);
+    plan.generations = GenerationsWithoutWaiting(plan.generations, free_frames);
     return plan.generations;
 }
 

@@ -130,6 +130,7 @@ private:
     vk::Instance instance;
 
     vk::DebugUtilsMessenger debug_messenger;
+    vk::DebugUtilsMessenger address_messenger;
 
     vk::SurfaceKHR surface;
 
@@ -155,6 +156,9 @@ private:
     VkSurfaceFormatKHR output_format{};
     f32 output_reference_white{};
     f32 output_peak{};
+
+    // DrawToFrame recreates the image when the layout size or format changes.
+    Frame screenshot_frame{};
 };
 
 } // namespace Vulkan

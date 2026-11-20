@@ -350,7 +350,7 @@ bool Replayer::BringUp(std::string& error) {
         const auto& header = state.As<StateRecord>();
         const auto it = channels.find(header.channel);
         auto* const channel = it != channels.end() ? it->second.get() : nullptr;
-        if (!StateAccess::Restore(state, channel, any_channel, syncpoints)) {
+        if (!StateAccess::Restore(state, reader.Version(), channel, any_channel, syncpoints)) {
             error = fmt::format("state record (kind {}, channel {}) doesn't fit this build",
                                 header.kind, header.channel);
             return false;
@@ -515,10 +515,10 @@ bool Replayer::Present(const Record& record, std::string& error) {
     }
 
     if (!options.record.empty() && presents == options.record_from) {
-        RecordOptions record{options.record, options.record_presents != 0
-                                                 ? options.record_presents
-                                                 : std::numeric_limits<u32>::max()};
-        if (!RequestRecording(record, error)) {
+        RecordOptions recording{options.record, options.record_presents != 0
+                                                    ? options.record_presents
+                                                    : std::numeric_limits<u32>::max()};
+        if (!RequestRecording(recording, error)) {
             return false;
         }
     }

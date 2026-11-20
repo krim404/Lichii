@@ -32,6 +32,7 @@ struct HostTranslateInfo {
     u32 max_descriptor_set_sampled_images{};
     u32 max_descriptor_set_storage_images{};
     u32 max_descriptor_set_input_attachements{};
+    u32 max_compute_shared_memory_size{}; ///< Zero when unknown
     bool support_float64{};      ///< True when the device supports 64-bit floats
     bool support_float16{};      ///< True when the device supports 16-bit floats
     bool support_int64{};        ///< True when the device supports 64-bit integers

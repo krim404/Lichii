@@ -4,10 +4,13 @@
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 
+#include <intrin.h>
 #include <windows.h>
 
 #include <dbghelp.h>
@@ -16,6 +19,14 @@
 #include "common/windows/crash_handler.h"
 
 #define LOG_CRASH(...) ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__, __VA_ARGS__)
+
+// MinGW's intrin.h declares _ReturnAddress but no library defines it (undefined symbol at link);
+// GCC and Clang have the builtin.
+#if defined(__MINGW32__)
+#define CRASH_RETURN_ADDRESS() __builtin_return_address(0)
+#else
+#define CRASH_RETURN_ADDRESS() _ReturnAddress()
+#endif
 
 namespace Common::Windows {
 namespace {
@@ -55,14 +66,16 @@ CodeAddress Locate(const void* address) {
     return result;
 }
 
-void Report(EXCEPTION_POINTERS* pointers) {
+// `fail_fast` names a failure that ends in a fail-fast (abort() or a CRT invalid-parameter
+// failure), and is null for an unhandled exception.
+void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
     // Called on the crashed thread's stack, which the dispatcher's frames sit on top of: the
     // stack from the faulting frame on is the part after the exception address.
     void* frames[40];
     const USHORT count = RtlCaptureStackBackTrace(1, 40, frames, nullptr);
-    const void* fault = pointers ? pointers->ExceptionRecord->ExceptionAddress : nullptr;
+    const void* fault = pointers->ExceptionRecord->ExceptionAddress;
     const USHORT first =
-        pointers ? static_cast<USHORT>(std::find(frames, frames + count, fault) - frames) : 0;
+        fail_fast ? 0 : static_cast<USHORT>(std::find(frames, frames + count, fault) - frames);
     char stack[1024] = "";
     std::size_t used = 0;
     for (USHORT i = first < count ? first : 0; i < count && frames[i]; ++i) {
@@ -84,7 +97,7 @@ void Report(EXCEPTION_POINTERS* pointers) {
         LocalFree(description);
     }
 
-    if (pointers) {
+    if (!fail_fast) {
         const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
         const CodeAddress at = Locate(fault);
         LOG_CRASH("Host crash: unhandled exception {:#010x} at {}+{:#x} on thread {} \"{}\", "
@@ -93,7 +106,7 @@ void Report(EXCEPTION_POINTERS* pointers) {
                   record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
                   record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0, stack);
     } else {
-        LOG_CRASH("Host crash: abort() on thread {} \"{}\"; stack:{}", GetCurrentThreadId(),
+        LOG_CRASH("Host crash: {} on thread {} \"{}\"; stack:{}", fail_fast, GetCurrentThreadId(),
                   thread_name, stack);
     }
 
@@ -106,13 +119,25 @@ void Report(EXCEPTION_POINTERS* pointers) {
         return;
     }
     MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
-    const BOOL written =
-        write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpWithThreadInfo,
-                   pointers ? &information : nullptr, nullptr, nullptr);
+    const BOOL written = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                                    MiniDumpWithThreadInfo, &information, nullptr, nullptr);
     const DWORD error = written ? 0 : GetLastError();
     CloseHandle(file);
     LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
               written ? "written next to the log as eden_crash.dmp" : "failed", error);
+}
+
+// Reports a fail-fast. The dump gets the context that RtlCaptureContext captures here, as a
+// 0xC0000409 exception at `address`, the C runtime's call into the handler. A debugger walks from
+// here up through the C runtime frames to the failing caller.
+void ReportFailFast(const char* failure, void* address) {
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = 0xC0000409; // What the fail-fast reports next.
+    record.ExceptionAddress = address;
+    EXCEPTION_POINTERS pointers{&record, &context};
+    Report(&pointers, failure);
 }
 
 // Only the first thread to crash reports. A second one waits a while for it to end the process,
@@ -132,7 +157,7 @@ bool BeginReport() {
 
 LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
     if (BeginReport()) {
-        Report(pointers);
+        Report(pointers, nullptr);
     }
     return previous_filter ? previous_filter(pointers) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -141,8 +166,19 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
 // asserts end in abort(), which the C runtime turns into a fail-fast that skips the filter above.
 void OnAbort(int) {
     if (BeginReport()) {
-        Report(nullptr);
+        ReportFailFast("abort()", CRASH_RETURN_ADDRESS());
     }
+}
+
+// A CRT function given an invalid parameter (a bad file descriptor or a null format string, for
+// example) also fail-fasts and skips the filter.
+void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, const wchar_t* file,
+                        unsigned int line, std::uintptr_t reserved) {
+    if (BeginReport()) {
+        ReportFailFast("CRT invalid-parameter failure", CRASH_RETURN_ADDRESS());
+    }
+    // What the C runtime does without a handler.
+    _invoke_watson(expression, function, file, line, reserved);
 }
 
 } // Anonymous namespace
@@ -160,6 +196,7 @@ void InstallCrashHandler(const std::filesystem::path& dump_directory) {
         GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "GetThreadDescription")));
     previous_filter = SetUnhandledExceptionFilter(OnUnhandledException);
     std::signal(SIGABRT, OnAbort);
+    _set_invalid_parameter_handler(OnInvalidParameter);
 }
 
 } // namespace Common::Windows

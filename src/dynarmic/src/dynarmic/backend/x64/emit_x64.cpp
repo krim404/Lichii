@@ -446,7 +446,7 @@ void EmitX64::ClearCache() {
     block_descriptors.clear();
     patch_information.clear();
 
-    PerfMapClear();
+    PerfMapClear(code.GetCodeBegin(), code.getCode() + code.GetTotalCodeSize());
 }
 
 void EmitX64::InvalidateBasicBlocks(const ::Common::unordered_set<IR::LocationDescriptor>& locations) {

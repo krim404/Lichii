@@ -309,6 +309,12 @@ Errno ProxySocket::SetReuseAddr(bool enable) {
     return SetSockOpt<u32>(fd, SO_REUSEADDR, enable ? 1 : 0);
 }
 
+Errno ProxySocket::SetReusePort(bool enable) {
+    std::lock_guard guard(packets_mutex);
+    reuse_port = enable;
+    return Errno::SUCCESS;
+}
+
 Errno ProxySocket::SetBroadcast(bool enable) {
     {
         std::lock_guard guard(packets_mutex);
@@ -355,6 +361,15 @@ Errno ProxySocket::SetNonBlock(bool enable) {
     return Errno::SUCCESS;
 }
 
+Errno ProxySocket::SetIpv6Option(Ipv6Option option, s32 value) {
+    // Rooms carry IPv4 alone, so a room socket is never an INET6 one.
+    return Errno::INVAL;
+}
+
+std::pair<s32, Errno> ProxySocket::GetIpv6Option(Ipv6Option option) {
+    return {0, Errno::INVAL};
+}
+
 std::pair<Errno, Errno> ProxySocket::GetPendingError() {
     LOG_DEBUG(Network, "(STUBBED) called");
     return {Errno::SUCCESS, Errno::SUCCESS};
@@ -363,6 +378,11 @@ std::pair<Errno, Errno> ProxySocket::GetPendingError() {
 std::pair<bool, Errno> ProxySocket::GetReuseAddr() {
     std::lock_guard guard(packets_mutex);
     return {reuse_addr, Errno::SUCCESS};
+}
+
+std::pair<bool, Errno> ProxySocket::GetReusePort() {
+    std::lock_guard guard(packets_mutex);
+    return {reuse_port, Errno::SUCCESS};
 }
 
 std::pair<bool, Errno> ProxySocket::GetNoDelay() {

@@ -12,6 +12,7 @@
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -199,18 +200,6 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
                 meta.localized_icons.front().second, "icon.dat");
         }
     }
-
-    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
-                                           [](const auto& package) {
-                                               return package.kind ==
-                                                      NupContainer::PackageKind::Addon;
-                                           });
-    if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
-    }
 }
 
 AppLoader_NUP::~AppLoader_NUP() = default;
@@ -240,8 +229,31 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
                                                 system.GetFileSystemController()));
 
+    // The frontend owns this provider, as for NX archives; aoc lists its add-ons and fsp opens
+    // them from it.
+    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
+            FileSys::ContentProviderUnionSlot::FrontendManual)) {
+        RegisterContent(*const_cast<FileSys::ManualContentProvider*>(
+            static_cast<const FileSys::ManualContentProvider*>(slot)));
+    }
+
     is_loaded = true;
     return result;
+}
+
+void AppLoader_NUP::RegisterContent(FileSys::ManualContentProvider& provider) const {
+    const auto& packages = nup->GetPackages();
+    const auto addon_count = std::ranges::count(packages, NupContainer::PackageKind::Addon,
+                                                &NupContainer::PackageInfo::kind);
+    if (addon_count == 0) {
+        return;
+    }
+    if (provider.AddEntriesFromContainer(file, true, base_title_id)) {
+        LOG_INFO(Loader, "NUP add-on content registered for {:016X}", base_title_id);
+    } else {
+        LOG_WARNING(Loader, "NUP container has {} add-on package(s), none usable by {:016X}",
+                    addon_count, base_title_id);
+    }
 }
 
 ResultStatus AppLoader_NUP::VerifyIntegrity(
@@ -328,6 +340,14 @@ ResultStatus AppLoader_NUP::ReadNSOModules(Modules& modules) {
         return ResultStatus::ErrorNotInitialized;
     }
     return secondary_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NUP::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+    return secondary_loader->ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

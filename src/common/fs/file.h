@@ -198,8 +198,9 @@ public:
 //     }
 // #endif
 
-    /// Closes the file if it is opened.
-    void Close();
+    /// Closes the file if it is opened. Returns false only when closing failed, which can be the
+    /// first report of a failed write.
+    bool Close();
 
     /**
      * Checks whether the file is open.

@@ -43,9 +43,13 @@ public:
             (std::min)(bound_ids.size(), size_t{current_limit} + 1));
     }
 
+    [[nodiscard]] bool ContainsIndex(u32 index) const noexcept {
+        return index <= current_limit && index < bound_ids.size();
+    }
+
     template <class MemoryManager>
     [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
-        DEBUG_ASSERT(index <= current_limit);
+        DEBUG_ASSERT(ContainsIndex(index));
         if (invalidated) {
             ClearReadDescriptors();
             invalidated = false;

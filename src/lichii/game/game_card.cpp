@@ -3,6 +3,9 @@
 
 #include <QPainter>
 #include <QPainterPath>
+#include <QStringList>
+#include <QTextLayout>
+#include <QTextOption>
 #include "game_card.h"
 #include "qt_common/config/uisettings.h"
 
@@ -65,9 +68,12 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     }
 
     if (UISettings::values.show_game_name.GetValue()) {
-        QRect textRect = cardRect;
-        textRect.setTop(iconRect.bottom() + cardMargin);
-        textRect.adjust(cardMargin, 0, -cardMargin, -cardMargin);
+        // Keep the title within the icon's width: at most two lines, cut with "..." beyond that.
+        // Without icons (size 0) it takes the card's width instead.
+        const int text_left = icon_size == 0 ? cardRect.left() + cardMargin : iconRect.left();
+        const int text_width = icon_size == 0 ? cardRect.width() - 2 * cardMargin : iconRect.width();
+        const QRect textRect(text_left, iconRect.bottom() + cardMargin, text_width,
+                             cardRect.bottom() - iconRect.bottom() - cardMargin);
 
         QString title = index.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
 
@@ -77,7 +83,27 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         font.setPixelSize(std::max(11.0, std::sqrt(static_cast<double>(icon_size))));
         painter->setFont(font);
 
-        painter->drawText(textRect, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, title);
+        // Words wider than the box break anywhere; what doesn't fit on the second line is elided.
+        const QFontMetrics fm(font);
+        QTextOption text_option;
+        text_option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        QTextLayout layout(title, font);
+        layout.setTextOption(text_option);
+        QStringList lines;
+        layout.beginLayout();
+        for (int i = 0; i < 2; ++i) {
+            QTextLine line = layout.createLine();
+            if (!line.isValid()) {
+                break;
+            }
+            line.setLineWidth(textRect.width());
+            lines.append(i == 0 ? title.mid(line.textStart(), line.textLength()).trimmed()
+                                : fm.elidedText(title.mid(line.textStart()).trimmed(),
+                                                Qt::ElideRight, textRect.width()));
+        }
+        layout.endLayout();
+        painter->drawText(textRect, Qt::AlignHCenter | Qt::AlignTop,
+                          lines.join(QLatin1Char('\n')));
     }
 
     painter->restore();

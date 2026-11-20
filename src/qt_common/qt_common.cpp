@@ -271,6 +271,13 @@ void Init(QWidget* root) {
 #endif
     LOG_INFO(Frontend, "Host CPU Threads: {}", processor_count);
     LOG_INFO(Frontend, "Host OS: {}", PrettyProductName().toStdString());
+#ifdef __unix__
+    LOG_INFO(Frontend, "Qt platform: {} | Session type: {}",
+             QGuiApplication::platformName().toStdString(),
+             qEnvironmentVariable("XDG_SESSION_TYPE", QStringLiteral("unknown")).toStdString());
+#else
+    LOG_INFO(Frontend, "Qt platform: {}", QGuiApplication::platformName().toStdString());
+#endif
     LOG_INFO(Frontend, "Host RAM: {:.2f} GiB",
              Common::GetMemInfo().TotalPhysicalMemory / f64{1_GiB});
     LOG_INFO(Frontend, "Host Swap: {:.2f} GiB", Common::GetMemInfo().TotalSwapMemory / f64{1_GiB});

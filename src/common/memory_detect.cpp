@@ -7,6 +7,7 @@
 #include <psapi.h>
 // clang-format on
 #else
+#include <sys/resource.h>
 #include <sys/types.h>
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -34,6 +35,19 @@
 #include "common/memory_detect.h"
 
 namespace Common {
+
+#ifdef __MINGW32__
+namespace {
+// MinGW's psapi.h does not declare PROCESS_MEMORY_COUNTERS_EX2 (Windows 10 1809 and later):
+// the Windows SDK's layout, spelled out.
+struct PROCESS_MEMORY_COUNTERS_EX2 : PROCESS_MEMORY_COUNTERS_EX {
+    SIZE_T PrivateWorkingSetSize;
+    ULONG64 SharedCommitUsage;
+};
+static_assert(sizeof(PROCESS_MEMORY_COUNTERS_EX2) ==
+              sizeof(PROCESS_MEMORY_COUNTERS_EX) + sizeof(SIZE_T) + sizeof(ULONG64));
+} // Anonymous namespace
+#endif
 
 // Detects the RAM and Swapfile sizes
 static MemoryInfo Detect() {
@@ -186,6 +200,23 @@ ProcessMemoryUsage GetProcessMemoryUsage() {
     }
 #endif
     return usage;
+}
+
+u64 GetProcessPageFaults() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        return 0;
+    }
+    return counters.PageFaultCount;
+#else
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0;
+    }
+    return static_cast<u64>(usage.ru_minflt) + static_cast<u64>(usage.ru_majflt);
+#endif
 }
 
 std::optional<u64> GetSystemCommitRoom() {

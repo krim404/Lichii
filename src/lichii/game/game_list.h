@@ -8,12 +8,17 @@
 
 #include <QLabel>
 #include <QLineEdit>
+#include <QHash>
 #include <QList>
+#include <QSet>
 #include <QPushButton>
 #include <QStandardItemModel>
 #include <QString>
+#include <QThreadPool>
 #include <QVBoxLayout>
 #include <QVector>
+#include <atomic>
+#include <memory>
 #include <QWidget>
 
 #include "common/common_types.h"
@@ -95,6 +100,9 @@ public slots:
     void RefreshGameDirectory();
     /// Shows a new name for every library entry of the program, without a rescan.
     void SetGameTitle(u64 program_id, const QString& title);
+    /// The user saved or removed the program's custom artwork: a lookup still running for it
+    /// does not replace that choice.
+    void OnCustomArtworkChanged(u64 program_id);
     void RefreshExternalContent();
     void UpdateIconSizes();
     void OnPopulate();
@@ -125,7 +133,7 @@ signals:
     void CopyTIDRequested(u64 program_id);
     void CreateShortcut(u64 program_id, const std::string& game_path,
                         const QtCommon::Game::ShortcutTarget target);
-    void OpenPerGameGeneralRequested(const std::string& file);
+    void OpenPerGameGeneralRequested(u64 program_id, const std::string& file);
     void LinkToRyujinxRequested(const u64& program_id);
     void OpenDirectory(const QString& directory);
     void AddDirectory();
@@ -155,6 +163,15 @@ private:
     void AddFavoritesPopup(QMenu& context_menu);
 
     void RetranslateUI();
+
+    /// Queues a SteamGridDB lookup for every game without artwork, once per game per session.
+    void QueueArtworkLookups();
+    /// Queues one game; forced lookups run again and replace existing custom artwork.
+    void QueueArtworkLookup(u64 program_id, const QString& title, bool forced);
+    void StartArtworkLookups();
+    /// Shows the program's custom artwork in every library entry of it, without a rescan.
+    void ShowCustomArtwork(u64 program_id);
+    QString GameTitle(u64 program_id) const;
 
     friend class GameListSearchField;
 
@@ -186,6 +203,33 @@ private:
     bool nx_tool_running{};
     u64 reportable_program_id{};
     QAbstractItemView* m_currentView = nullptr;
+
+    struct ArtworkLookup {
+        u64 program_id;
+        QString title;
+        bool forced{};
+        /// Only the newest lookup of a program may save its result.
+        u64 serial{};
+        /// The API key the lookup ran with.
+        std::string key;
+    };
+    QList<ArtworkLookup> artwork_queue;
+    QSet<u64> artwork_attempted;
+    QHash<u64, u64> artwork_newest;
+    /// Programs whose running newest lookup was asked for by the user.
+    QSet<u64> artwork_forced;
+    u64 artwork_serial = 0;
+    /// The API key the attempted games were looked up with.
+    std::string artwork_key;
+    int artwork_running = 0;
+    bool artwork_failure_logged = false;
+    /// Programs whose looked up artwork was saved since the last scan finished. A scan can add
+    /// their rows with the default picture after the save, so the artwork is shown again.
+    QSet<u64> artwork_saved;
+    std::shared_ptr<std::atomic_bool> artwork_cancel = std::make_shared<std::atomic_bool>(false);
+    /// Lookups wait on the network: their own threads keep them from holding up a library scan
+    /// on the global pool.
+    QThreadPool artwork_pool;
 };
 
 class GameListPlaceholder : public QWidget {

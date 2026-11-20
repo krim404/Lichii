@@ -244,6 +244,19 @@ void ShaderJobScheduler::Cancel(const ShaderJobHandle& handle) {
     }
 }
 
+std::optional<ShaderJobStatus> ShaderJobScheduler::CancelQueued(const ShaderJobHandle& handle) {
+    ShaderJobState& job{*handle.state};
+    std::vector<ShaderJob> dead;
+    std::scoped_lock lock{mutex};
+    const ShaderJobStatus status{job.status.load()};
+    if (!IsQueued(status)) {
+        return std::nullopt;
+    }
+    job.stop = true;
+    Finish(job, ShaderJobStatus::Cancelled, dead);
+    return status;
+}
+
 void ShaderJobScheduler::Cancel(const ShaderJobBatch& batch) {
     std::vector<ShaderJob> dead;
     std::scoped_lock lock{mutex};
@@ -261,15 +274,25 @@ void ShaderJobScheduler::Cancel(const ShaderJobBatch& batch) {
 
 void ShaderJobScheduler::RunOrWait(const ShaderJobHandle& handle) {
     Promote(handle, ShaderJobPriority::NeedNow);
+    ShaderJobState& job{*handle.state};
     std::unique_lock lock{mutex};
-    switch (handle.state->status.load()) {
+    if (job.status.load() == ShaderJobStatus::Cpu) {
+        lock.unlock();
+        {
+            std::unique_lock job_lock{job.mutex};
+            job.condition.wait(job_lock,
+                               [&] { return job.status.load() != ShaderJobStatus::Cpu; });
+        }
+        lock.lock();
+    }
+    switch (job.status.load()) {
     case ShaderJobStatus::Queued:
-        StartStage(*handle.state, false, Clock::now());
+        StartStage(job, false, Clock::now());
         lock.unlock();
         RunCpu(handle.state, true);
         return;
     case ShaderJobStatus::DriverQueued:
-        StartStage(*handle.state, true, Clock::now());
+        StartStage(job, true, Clock::now());
         lock.unlock();
         RunDriver(handle.state);
         return;
@@ -439,10 +462,16 @@ void ShaderJobScheduler::RunCpu(const JobPtr& job, bool run_driver_here) {
                 StartStage(*job, true, Clock::now());
                 run_driver = true;
             } else {
-                job->status = ShaderJobStatus::DriverQueued;
+                {
+                    std::scoped_lock job_lock{job->mutex};
+                    job->status = ShaderJobStatus::DriverQueued;
+                }
                 job->queued_priority = job->priority.load();
                 driver_queue[Index(job->queued_priority)].push_back(job);
                 driver_condition.notify_one();
+                // Wakes a RunOrWait caller waiting out the CPU stage, so it runs the driver stage
+                // itself instead of waiting behind the driver pool.
+                job->condition.notify_all();
             }
         }
     }

@@ -20,8 +20,6 @@
 #include <QTreeView>
 
 #include "common/common_types.h"
-#include "common/fs/fs.h"
-#include "common/fs/path_util.h"
 #include "configuration/addon/mod_select_dialog.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
@@ -120,14 +118,9 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
         }
     }
 
-    auto current = Settings::values.disabled_addons[title_id];
-    std::sort(disabled_addons.begin(), disabled_addons.end());
-    std::sort(current.begin(), current.end());
-    if (disabled_addons != current) {
-        Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                               "game_list" / fmt::format("{:016X}.pv.txt", title_id));
-    }
+    disabled_addons = FileSys::StoredDisabledAddons(title_id, std::move(disabled_addons));
 
+    std::sort(disabled_addons.begin(), disabled_addons.end());
     Settings::values.disabled_addons[title_id] = disabled_addons;
 }
 
@@ -324,6 +317,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
         auto* const first_item = new QStandardItem;
         first_item->setText(name);
         first_item->setCheckable(true);
+        if (!patch.description.empty()) {
+            first_item->setToolTip(QString::fromStdString(patch.description));
+        }
 
         const bool is_external_update = patch.type == FileSys::PatchType::Update &&
                                         patch.source == FileSys::PatchSource::External &&
@@ -338,7 +334,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
         }
 
         bool patch_disabled = false;
-        if (is_external_update) {
+        if (patch.off_by_default) {
+            patch_disabled = !patch.enabled;
+        } else if (is_external_update) {
             std::string disabled_key = fmt::format("Update@{}", patch.numeric_version);
             patch_disabled =
                 std::find(disabled.begin(), disabled.end(), disabled_key) != disabled.end();

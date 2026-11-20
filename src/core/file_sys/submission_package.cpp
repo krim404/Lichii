@@ -25,6 +25,7 @@ namespace FileSys {
 NSP::NSP(VirtualFile file_, u64 title_id_, std::size_t program_index_)
     : file(std::move(file_)), expected_program_id(title_id_),
       program_index(program_index_), status{Loader::ResultStatus::Success},
+      nca_error{Loader::ResultStatus::ErrorNSPMissingProgramNCA},
       pfs(std::make_shared<PartitionFilesystem>(file)), keys{Core::Crypto::KeyManager::Instance()} {
     if (pfs->GetStatus() != Loader::ResultStatus::Success) {
         status = pfs->GetStatus();
@@ -32,6 +33,15 @@ NSP::NSP(VirtualFile file_, u64 title_id_, std::size_t program_index_)
     }
 
     const auto files = pfs->GetFiles();
+
+    // Reject unsupported compressed entries before importing tickets or opening any NCAs.
+    for (const auto& entry : files) {
+        if (entry->GetName().ends_with(".ncz") && !Core::Crypto::IsSupportedNCZ(entry)) {
+            LOG_ERROR(Service_FS, "Unsupported NCZ entry header (solid window limit: 128 MiB)");
+            status = Loader::ResultStatus::ErrorBadNCAHeader;
+            return;
+        }
+    }
 
     if (IsDirectoryExeFS(pfs)) {
         extracted = true;
@@ -45,6 +55,30 @@ NSP::NSP(VirtualFile file_, u64 title_id_, std::size_t program_index_)
 
 NSP::~NSP() = default;
 
+VirtualFile NSP::GetNCAFileById(const std::array<u8, 16>& id) const {
+    std::scoped_lock lock{resolved_nca_files_mutex};
+    if (const auto found = resolved_nca_files.find(id); found != resolved_nca_files.end()) {
+        // A solid NCZ reader recovers from a full disk or decoder budget by itself, but isn't
+        // readable until then, and stays failed after corrupt data or a source that changed
+        // size: reopen it.
+        if (found->second->IsReadable()) {
+            return found->second;
+        }
+        resolved_nca_files.erase(found);
+    }
+    const auto name = Common::HexToString(id, false);
+    auto result = pfs->GetFile(fmt::format("{}.nca", name));
+    if (!result) {
+        if (auto compressed = pfs->GetFile(fmt::format("{}.ncz", name))) {
+            result = Core::Crypto::DecompressNCZ(compressed, fmt::format("{}.nca", name));
+        }
+    }
+    if (result) {
+        resolved_nca_files.emplace(id, result);
+    }
+    return result;
+}
+
 Loader::ResultStatus NSP::GetStatus() const {
     return status;
 }
@@ -56,7 +90,7 @@ Loader::ResultStatus NSP::GetProgramStatus() const {
 
     const auto iter = program_status.find(GetProgramTitleID());
     if (iter == program_status.end())
-        return Loader::ResultStatus::ErrorNSPMissingProgramNCA;
+        return program_status.empty() ? nca_error : Loader::ResultStatus::ErrorNSPMissingProgramNCA;
     return iter->second;
 }
 
@@ -226,8 +260,11 @@ void NSP::ReadNCAs(const std::vector<VirtualFile>& files) {
         }
 
         const auto nca = std::make_shared<NCA>(outer_file);
-        if (nca->GetStatus() != Loader::ResultStatus::Success || nca->GetSubdirectories().empty()) {
-            program_status[nca->GetTitleId()] = nca->GetStatus();
+        if (nca->GetStatus() != Loader::ResultStatus::Success) {
+            nca_error = nca->GetStatus();
+            continue;
+        }
+        if (nca->GetSubdirectories().empty()) {
             continue;
         }
 
@@ -244,18 +281,7 @@ void NSP::ReadNCAs(const std::vector<VirtualFile>& files) {
 
             for (const auto& rec : cnmt.GetContentRecords()) {
                 const auto id_string = Common::HexToString(rec.nca_id, false);
-                auto next_file = pfs->GetFile(fmt::format("{}.nca", id_string));
-
-                if (next_file == nullptr) {
-                    auto ncz_file = pfs->GetFile(fmt::format("{}.ncz", id_string));
-                    if (ncz_file != nullptr) {
-                        next_file = Core::Crypto::DecompressNCZ(ncz_file, fmt::format("{}.nca", id_string));
-                        if (next_file == nullptr) {
-                            LOG_DEBUG(Service_FS, "Skipping solid or unsupported NCZ content {}.ncz", id_string);
-                            continue;
-                        }
-                    }
-                }
+                auto next_file = GetNCAFileById(rec.nca_id);
 
                 if (next_file == nullptr) {
                     if (rec.type != ContentRecordType::DeltaFragment) {
@@ -270,14 +296,18 @@ void NSP::ReadNCAs(const std::vector<VirtualFile>& files) {
 
                 auto next_nca = std::make_shared<NCA>(std::move(next_file));
 
+                if (next_nca->GetStatus() != Loader::ResultStatus::Success &&
+                    next_nca->GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
+                    if (rec.type == ContentRecordType::Program) {
+                        program_status.try_emplace(cnmt.GetTitleID() + rec.id_offset,
+                                                   next_nca->GetStatus());
+                    }
+                    continue;
+                }
+
                 if (next_nca->GetType() == NCAContentType::Program) {
                     program_status[next_nca->GetTitleId()] = next_nca->GetStatus();
                     program_ids.insert(next_nca->GetTitleId() & 0xFFFFFFFFFFFFF000);
-                }
-
-                if (next_nca->GetStatus() != Loader::ResultStatus::Success &&
-                    next_nca->GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
-                    continue;
                 }
 
                 // If the last 3 hexadecimal digits of the CNMT TitleID is 0x800 or is missing the

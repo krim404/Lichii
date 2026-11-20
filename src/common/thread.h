@@ -50,6 +50,10 @@ public:
     /// in a hardware wait; this sleeps on a high-resolution waitable timer instead.
     bool SleepFor(const std::chrono::nanoseconds time);
 
+    /// Like WaitFor, but never blocks in the OS: waits in WaitForFlag, so a wake ends within
+    /// microseconds of the deadline. For short waits; the thread counts as running throughout.
+    bool SpinFor(const std::chrono::nanoseconds time);
+
     template<class Clock, class Duration>
     bool WaitUntil(const std::chrono::time_point<Clock, Duration> time) {
         std::unique_lock lk{mutex};

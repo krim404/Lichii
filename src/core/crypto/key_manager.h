@@ -344,6 +344,8 @@ private:
 Key128 GenerateKeyEncryptionKey(Key128 source, Key128 master, Key128 kek_seed, Key128 key_seed);
 Key128 DeriveKeyblobKey(const Key128& sbk, const Key128& tsec, Key128 source);
 Key128 DeriveKeyblobMACKey(const Key128& keyblob_key, const Key128& mac_source);
+/// AES-128-CMAC of source under key, or nullopt if OpenSSL cannot compute it.
+std::optional<Key128> CalculateCMAC(std::span<const u8> source, const Key128& key);
 Key128 DeriveMasterKey(const std::array<u8, 0x90>& keyblob, const Key128& master_source);
 std::array<u8, 0x90> DecryptKeyblob(const std::array<u8, 0xB0>& encrypted_keyblob, const Key128& key);
 

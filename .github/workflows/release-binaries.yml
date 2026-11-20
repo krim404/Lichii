@@ -7,6 +7,10 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
+      nsight_aftermath:
+        description: Build Windows with Nsight Aftermath GPU crash dumps (test builds only, no NVIDIA files shipped)
+        type: boolean
+        default: false
   push:
     branches:
       - nx2-experimental
@@ -48,6 +52,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Refuse to publish an Aftermath build
+        if: inputs.nsight_aftermath && inputs.publish_release
+        run: |
+          echo "nsight_aftermath builds are test builds; run them with publish_release=false"
+          exit 1
+
       - name: Prepare release tag
         if: github.event_name == 'push' || inputs.publish_release
         shell: bash
@@ -159,7 +169,7 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       - name: Install Qt on Linux ARM64
@@ -170,7 +180,7 @@ jobs:
           host: linux_arm64
           target: desktop
           arch: linux_gcc_arm64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # Ubuntu's own clang 18 cannot read a profile from a current LLVM, so take clang from the LLVM
@@ -218,7 +228,7 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # ccache does not handle MSVC-style command lines well, so the clang-cl job uses sccache. The
@@ -243,6 +253,26 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: glslangValidator --version
+
+      # Only the SDK's headers are kept: the tracker loads GFSDK_Aftermath_Lib.x64.dll at run time,
+      # so the tester supplies his own copy and the artifact holds no NVIDIA files.
+      - name: Fetch Nsight Aftermath SDK headers
+        if: startsWith(matrix.platform, 'windows') && inputs.nsight_aftermath
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'aftermath-sdk.zip'
+          Invoke-WebRequest -OutFile $zip https://developer.nvidia.com/downloads/assets/tools/secure/nsight-aftermath-sdk/2026_3_0/windows_x64/NVIDIA_Nsight_Aftermath_SDK_2026.3.0.26197-windows_x64.zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne 'e38136a60110199559b7365d3ea4ec0cb5588dc2b0f593877d864e0299659a3f') {
+            throw "Nsight Aftermath SDK hash $hash does not match the pinned release"
+          }
+          $extracted = Join-Path $env:RUNNER_TEMP 'aftermath-sdk-zip'
+          Expand-Archive $zip -DestinationPath $extracted
+          $sdk = Join-Path $env:RUNNER_TEMP 'aftermath-sdk'
+          New-Item -ItemType Directory -Force $sdk | Out-Null
+          Move-Item (Join-Path $extracted 'include') $sdk
+          Remove-Item -Recurse -Force $extracted, $zip
+          "NSIGHT_AFTERMATH_SDK=$($sdk -replace '\\', '/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Restore CPM downloads
         id: cpm-cache
@@ -320,7 +350,11 @@ jobs:
             flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
             flags+=" -Wno-error=backend-plugin"
           fi
-          cmake -S . -B build/release -G Ninja \
+          aftermath=()
+          if [ '${{ inputs.nsight_aftermath }}' = true ]; then
+            aftermath=(-DENABLE_NSIGHT_AFTERMATH=ON)
+          fi
+          cmake -S . -B build/release -G Ninja "${aftermath[@]}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
             -DLICHII_TESTS=OFF \
@@ -340,6 +374,8 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
             "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
             "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            "-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /OPT:REF /OPT:ICF" \
             "-DCMAKE_C_FLAGS=$flags" \
             "-DCMAKE_CXX_FLAGS=-EHsc $flags"
 
@@ -423,10 +459,13 @@ jobs:
 
       # Both Linux packages are self-contained: linuxdeploy bundles every library the two programs
       # need except the base system ones (glibc, X11/Wayland client libraries, the GPU driver and
-      # Vulkan loader), and its Qt plugin adds the Qt libraries and platform plugins. The AppImage
-      # packs that folder into one file; the tar.gz holds the same folder for systems without FUSE,
-      # with lichii and eden-cli links at its top. Both run on glibc 2.39+ systems. A tar.gz of the
-      # bare programs needed the Qt 6.8 they were built against installed system-wide (#901).
+      # Vulkan loader), and its Qt plugin adds the Qt libraries and platform plugins. linuxdeploy's
+      # own exclude list lacks libvulkan.so.1, which fsr4-vk and the -pgo builds' libplacebo link,
+      # so it is excluded by name: the bundled loader replaced the system one and failed Vulkan
+      # init (#1767). The AppImage packs that folder into one file; the tar.gz holds the same
+      # folder for systems without FUSE, with lichii and eden-cli links at its top. Both run on
+      # glibc 2.39+ systems. A tar.gz of the bare programs needed the Qt 6.8 they were built
+      # against installed system-wide (#901).
       - name: Package Linux AppImage and tar.gz
         if: startsWith(matrix.platform, 'linux')
         shell: bash
@@ -469,6 +508,7 @@ jobs:
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
             "${fsr4_library[@]}" \
+            --exclude-library 'libvulkan.so*' \
             --desktop-file dist/io.github.zortos293.lichii.desktop \
             --icon-file "$icon" \
             --plugin qt \
@@ -481,6 +521,10 @@ jobs:
           ln -s usr/bin/eden-cli lichii/eden-cli
           tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" lichii
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
+          if tar -tzf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" | grep '/libvulkan\.so'; then
+            echo "::error::The package bundles the Vulkan loader"
+            exit 1
+          fi
           # Both x86-64 packages must carry fsr4-vk and its licences.
           if [ "$arch" = x86_64 ]; then
             test "$(tar -tzf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" |
@@ -503,7 +547,13 @@ jobs:
               throw "build/release/bin/$exe was not produced"
             }
           }
+          # Symbols ship as their own artifact, not in the release zip.
+          New-Item -ItemType Directory -Force build/release/symbols | Out-Null
+          Move-Item build/release/bin/*.pdb build/release/symbols/
           windeployqt --release --no-translations build/release/bin/lichii.exe
+          if (Get-ChildItem -Recurse build/release/bin -Filter 'GFSDK_*') {
+            throw 'build/release/bin holds Nsight Aftermath files, which must not ship'
+          }
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
@@ -517,6 +567,9 @@ jobs:
           app=build/release/bin/lichii.app
           test -x "$app/Contents/MacOS/lichii"
           test -x build/release/bin/eden-cli
+          cmp dist/nx2_switches.txt "$app/Contents/Resources/nx2_switches.txt"
+          test ! -e "$app/Contents/MacOS/nx2_switches.txt"
+          python3 tools/nx2/test_switches.py SwitchDiscovery.test_signed_macos_resources_and_precedence
           cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
           "$(brew --prefix qt@6)/bin/macdeployqt" "$app" \
             -executable="$app/Contents/MacOS/eden-cli" -libpath="$(brew --prefix)/lib" \
@@ -581,10 +634,19 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         uses: actions/upload-artifact@v7
         with:
-          name: lichii-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}${{ inputs.nsight_aftermath && '-aftermath' || '' }}-${{ github.sha }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Upload Windows symbols
+        if: startsWith(matrix.platform, 'windows')
+        uses: actions/upload-artifact@v7
+        with:
+          name: symbols-${{ matrix.platform }}${{ inputs.nsight_aftermath && '-aftermath' || '' }}-${{ github.sha }}
+          path: build/release/symbols/
+          if-no-files-found: error
+          retention-days: 90
 
       # Both Linux files go in one artifact: the tar.gz and the AppImage.
       - name: Upload Linux binary

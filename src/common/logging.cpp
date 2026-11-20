@@ -305,7 +305,7 @@ struct FileBackend final : public Backend {
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            file->Flush();
+            Flush();
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
@@ -316,12 +316,18 @@ struct FileBackend final : public Backend {
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
                 enabled = false;
-            file->Flush();
+            Flush();
         }
     }
 
     void Flush() noexcept override {
+        // A failed flush logs an Error, whose own flush would fail and log again without end.
+        static thread_local bool flushing = false;
+        if (flushing)
+            return;
+        flushing = true;
         file->Flush();
+        flushing = false;
     }
 
     std::filesystem::path file_path;
@@ -428,6 +434,10 @@ struct Impl {
     LogcatBackend lc_backend{};
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+#ifndef __OPENORBIS__
+    // Last, so it stops before the file backend it flushes is destroyed.
+    std::jthread file_flush_thread;
+#endif
 };
 } // Anonymous namespace
 
@@ -467,6 +477,17 @@ void Initialize() {
 }
 
 void Start() {
+#ifndef __OPENORBIS__
+    // Lines below Error wait in the file's buffer until it fills. Flushing it every second keeps a
+    // hang or a kill from losing more than the last second of the log.
+    if (!logging_instance || !logging_instance->file_backend || logging_instance->file_flush_thread.joinable())
+        return;
+    logging_instance->file_flush_thread = std::jthread([&backend = *logging_instance->file_backend](std::stop_token token) {
+        Common::SetCurrentThreadName("LogFlush");
+        while (Common::StoppableTimedWait(token, std::chrono::seconds{1}))
+            backend.Flush();
+    });
+#endif
 }
 
 void Stop() {

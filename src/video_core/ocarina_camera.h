@@ -56,4 +56,24 @@ inline OcarinaCamera DecodeOcarinaCamera(std::span<const f32> values, u32 target
     return camera;
 }
 
+/// The FSR jitter for a phase (from 1) as a Halton (2, 3) offset in render pixels, applied to the
+/// scene's viewport. AMD's own drivers (PAL) clip each viewport to an integer scissor that drops
+/// the fraction of its right and bottom edges, so a negative offset loses the last column and row
+/// of every jittered draw there; on those drivers the offsets stay in [0, 1) instead of
+/// [-0.5, 0.5).
+inline std::array<f32, 2> OcarinaJitter(u32 index, bool truncated_viewport_edges) {
+    const auto halton = [](u32 value, u32 base) {
+        f32 fraction = 1.0f;
+        f32 result = 0.0f;
+        while (value > 0) {
+            fraction /= static_cast<f32>(base);
+            result += fraction * static_cast<f32>(value % base);
+            value /= base;
+        }
+        return result;
+    };
+    const f32 center = truncated_viewport_edges ? 0.0f : 0.5f;
+    return {halton(index, 2) - center, halton(index, 3) - center};
+}
+
 } // namespace VideoCommon

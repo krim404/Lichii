@@ -71,9 +71,20 @@ LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each) 
         if (size > 0) {
             log.bytes.resize(static_cast<size_t>(size));
             stream.seekg(0);
-            stream.read(reinterpret_cast<char*>(log.bytes.data()), size);
+            // In chunks: MinGW's libstdc++ hands one read to the CRT's _read, which aborts the
+            // process (invalid parameter) on a count above INT_MAX, a cache past 2 GiB
+            constexpr std::streamoff Chunk = std::streamoff{256} << 20;
+            std::streamoff done = 0;
+            while (done < size) {
+                const std::streamoff want = std::min(Chunk, size - done);
+                stream.read(reinterpret_cast<char*>(log.bytes.data()) + done, want);
+                done += stream.gcount();
+                if (stream.gcount() != want) {
+                    break;
+                }
+            }
             // Cut short when the file shrank since (a compaction replaced it)
-            log.bytes.resize(static_cast<size_t>(stream.gcount()));
+            log.bytes.resize(static_cast<size_t>(done));
         }
     }
     log.parsed = ParseLog(log.bytes, for_each);

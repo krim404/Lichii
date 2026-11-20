@@ -252,6 +252,25 @@ TEST_CASE("WaitForFlag times out unset and wakes on a store", "[common][event]")
     CHECK(Common::WaitForFlag(flag, std::chrono::steady_clock::now()));
 }
 
+TEST_CASE("Event::SpinFor times out unset and consumes a signal", "[common][event]") {
+    Common::Event event;
+    auto start = std::chrono::steady_clock::now();
+    CHECK_FALSE(event.SpinFor(2ms));
+    CHECK(std::chrono::steady_clock::now() - start >= 2ms);
+
+    event.Set();
+    CHECK(event.SpinFor(1s));
+    CHECK_FALSE(event.IsSet());
+
+    std::jthread setter([&] {
+        std::this_thread::sleep_for(1ms);
+        event.Set();
+    });
+    start = std::chrono::steady_clock::now();
+    CHECK(event.SpinFor(5s));
+    CHECK(std::chrono::steady_clock::now() - start < 1s);
+}
+
 // Wake-up latency of a store to a waiting thread: WaitForFlag against a condition variable.
 // tests "[.wait_for_flag_benchmark]" runs it.
 TEST_CASE("WaitForFlag wake latency", "[.wait_for_flag_benchmark]") {
